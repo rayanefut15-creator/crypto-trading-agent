@@ -1,0 +1,15 @@
+# ─────────────────────────────────────────────────────────────
+#  FICHIERS À NE JAMAIS ENVOYER SUR GITHUB
+# ─────────────────────────────────────────────────────────────
+
+# Clés API secrètes — NE JAMAIS publier ce fichier !
+.env
+
+# Fichiers Python temporaires (créés automatiquement par Python)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers système Mac (créés automatiquement par macOS)
+.DS_Store

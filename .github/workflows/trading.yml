@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────
+#  GITHUB ACTIONS — Agent de Trading Crypto
+# ─────────────────────────────────────────────────────────────
+#
+#  Ce fichier dit à GitHub quoi faire toutes les 30 minutes :
+#  1. Télécharger ton code depuis GitHub
+#  2. Installer Python et les bibliothèques
+#  3. Lancer UN cycle d'analyse (trading_agent.py --once)
+#  4. Sauvegarder les fichiers mis à jour (Excel, portfolio, cache)
+#
+#  Tes clés API sont stockées dans GitHub Secrets (jamais dans le code).
+
+name: 🤖 Agent de Trading Crypto
+
+on:
+  # ── Déclenchement automatique toutes les 30 minutes ──
+  # Format cron : minute heure jour mois jour_semaine
+  # */30 * * * * = toutes les 30 minutes (à HH:00 et HH:30)
+  schedule:
+    - cron: '*/30 * * * *'
+
+  # ── Déclenchement manuel depuis l'interface GitHub ──
+  # Utile pour tester sans attendre 30 min
+  workflow_dispatch:
+
+# Autorisation nécessaire pour que GitHub Actions puisse
+# sauvegarder les fichiers (Excel, portfolio, cache) dans le repo
+permissions:
+  contents: write
+
+jobs:
+  analyse:
+    # Utiliser une machine virtuelle Ubuntu (gratuite sur GitHub)
+    runs-on: ubuntu-latest
+
+    # Sécurité : tuer le job si ça dure plus de 10 minutes
+    # (normalement un cycle dure 1-2 minutes max)
+    timeout-minutes: 10
+
+    steps:
+      # ── Étape 1 : Télécharger le code depuis GitHub ──
+      - name: 📥 Récupérer le code
+        uses: actions/checkout@v4
+
+      # ── Étape 2 : Installer Python 3.11 ──
+      - name: 🐍 Configurer Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'   # Mettre les bibliothèques en cache pour aller plus vite
+
+      # ── Étape 3 : Installer toutes les bibliothèques ──
+      - name: 📦 Installer les bibliothèques
+        run: pip install -r requirements.txt
+
+      # ── Étape 4 : Lancer un cycle d'analyse ──
+      # Les clés API sont injectées depuis GitHub Secrets (Settings → Secrets → Actions)
+      # Elles ne sont JAMAIS visibles dans les logs ni dans le code
+      - name: 🔄 Lancer un cycle d'analyse
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NEWSDATA_API_KEY:  ${{ secrets.NEWSDATA_API_KEY }}
+          BINANCE_API_KEY:   ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_SECRET:    ${{ secrets.BINANCE_SECRET }}
+        run: python trading_agent.py --once
+
+      # ── Étape 5 : Sauvegarder les fichiers mis à jour dans GitHub ──
+      # On sauvegarde : le journal Excel, l'état du portfolio, et le cache des news
+      # Si aucun fichier n'a changé (pas de nouvelles news), on ne crée pas de commit inutile
+      - name: 💾 Sauvegarder les fichiers d'état
+        run: |
+          # Configurer l'identité du "bot" qui va faire les commits
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Ajouter les fichiers d'état au commit (le || true évite une erreur si un fichier n'existe pas encore)
+          git add cache_news.json portfolio_state.json trading_journal.xlsx 2>/dev/null || true
+
+          # Vérifier s'il y a des changements à sauvegarder
+          if git diff --staged --quiet; then
+            echo "ℹ️  Aucun changement à sauvegarder (pas de nouvelles news ce cycle)."
+          else
+            # Créer un commit avec la date/heure UTC
+            git commit -m "📊 Cycle du $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+            echo "✅ Fichiers sauvegardés dans GitHub."
+          fi
