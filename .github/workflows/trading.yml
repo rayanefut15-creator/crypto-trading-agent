@@ -65,22 +65,27 @@ jobs:
         run: python trading_agent.py --once
 
       # ── Étape 5 : Sauvegarder les fichiers mis à jour dans GitHub ──
-      # On sauvegarde : le journal Excel, l'état du portfolio, et le cache des news
-      # Si aucun fichier n'a changé (pas de nouvelles news), on ne crée pas de commit inutile
       - name: 💾 Sauvegarder les fichiers d'état
         run: |
-          # Configurer l'identité du "bot" qui va faire les commits
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Ajouter les fichiers d'état au commit (le || true évite une erreur si un fichier n'existe pas encore)
-          git add cache_news.json portfolio_state.json trading_journal.xlsx 2>/dev/null || true
+          # Diagnostique : afficher les fichiers créés par le script
+          echo "📂 Fichiers générés par le script :"
+          ls -lh trading_journal.xlsx portfolio_state.json cache_news.json 2>/dev/null || echo "  (aucun fichier trouvé)"
 
-          # Vérifier s'il y a des changements à sauvegarder
-          if git diff --staged --quiet; then
-            echo "ℹ️  Aucun changement à sauvegarder (pas de nouvelles news ce cycle)."
+          # Ajouter les fichiers au staging (git add -f force l'ajout des fichiers binaires)
+          git add -f trading_journal.xlsx portfolio_state.json cache_news.json 2>/dev/null || true
+
+          # git status --porcelain est fiable pour tous types de fichiers (texte ET binaires)
+          # Les lignes ne commençant pas par '??' sont des changements stagés
+          CHANGES=$(git status --porcelain | grep -v '^??' || true)
+
+          if [ -z "$CHANGES" ]; then
+            echo "ℹ️  Aucun changement à sauvegarder ce cycle."
           else
-            # Créer un commit avec la date/heure UTC
+            echo "📝 Changements détectés :"
+            echo "$CHANGES"
             git commit -m "📊 Cycle du $(date -u '+%Y-%m-%d %H:%M UTC')"
             git push
             echo "✅ Fichiers sauvegardés dans GitHub."
