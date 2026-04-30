@@ -496,16 +496,15 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     nouvelles_news = recuperer_nouvelles_news()
 
     if not nouvelles_news:
-        log("💤 Pas de nouvelles news ce cycle.")
+        log("💤 Pas de nouvelles news ce cycle — écriture heartbeat dans Excel.")
         prix_btc = recuperer_prix_btc()
-        if prix_btc > 0:
-            valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
-            enregistrer_dans_excel(
-                prix_btc, [],
-                {"score": 0, "recommandation": "ATTENDRE", "modele_utilise": "—"},
-                "ATTENDRE",
-                valeur_portfolio,
-            )
+        valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
+        enregistrer_dans_excel(
+            prix_btc, [],
+            {"score": 0, "recommandation": "ATTENDRE", "modele_utilise": "—"},
+            "ATTENDRE",
+            valeur_portfolio,
+        )
         return portefeuille
 
     # ── Étape 2 : Récupérer le prix BTC ──
