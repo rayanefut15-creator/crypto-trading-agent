@@ -20,7 +20,6 @@ import sys          # Lire les arguments passés au script (ex: --once)
 import time         # Faire des pauses entre les cycles
 import json         # Sauvegarder des données dans des fichiers texte
 import requests     # Appeler l'API NewsData.io
-import ccxt         # Se connecter à Binance pour lire les prix
 import anthropic    # Utiliser l'IA Claude pour analyser les news
 import openpyxl     # Lire et écrire des fichiers Excel
 from datetime import datetime   # Gérer les dates et heures
@@ -179,29 +178,22 @@ def recuperer_nouvelles_news() -> list:
 
 
 # ─────────────────────────────────────────────────────────────
-#  ÉTAPE 2 : RÉCUPÉRATION DU PRIX BTC (Binance via ccxt)
+#  ÉTAPE 2 : RÉCUPÉRATION DU PRIX BTC (CoinGecko API publique)
 # ─────────────────────────────────────────────────────────────
 
 def recuperer_prix_btc() -> float:
     """
-    Récupère le prix actuel du Bitcoin (BTC/USDT) sur Binance.
-    Utilise ccxt en mode lecture seule (aucun ordre, aucun risque).
+    Récupère le prix actuel du Bitcoin via l'API publique CoinGecko.
+    Aucune clé API requise — fonctionne depuis n'importe quel serveur.
 
     Retourne : le prix en float (ex: 68234.50) ou 0.0 si erreur.
     """
     try:
-        # Connexion à Binance (la lecture des prix est publique)
-        exchange = ccxt.binance({
-            "apiKey": BINANCE_API_KEY,
-            "secret": BINANCE_SECRET,
-            "options": {"defaultType": "spot"},  # Marché spot (pas les futures)
-        })
-
-        # Récupérer le ticker = les informations de prix actuelles
-        ticker = exchange.fetch_ticker("BTC/USDT")
-        prix   = float(ticker["last"])  # "last" = dernier prix de transaction
-
-        log(f"💰 Prix actuel du BTC : {prix:,.2f} USDT")
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+        reponse = requests.get(url, timeout=10)
+        reponse.raise_for_status()
+        prix = float(reponse.json()["bitcoin"]["usd"])
+        log(f"💰 Prix actuel du BTC : {prix:,.2f} USD (CoinGecko)")
         return prix
 
     except Exception as e:
