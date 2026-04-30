@@ -74,8 +74,8 @@ jobs:
           echo "📂 Fichiers générés par le script :"
           ls -lh trading_journal.xlsx portfolio_state.json cache_news.json 2>/dev/null || echo "  (aucun fichier trouvé)"
 
-          # Ajouter les fichiers au staging (git add -f force l'ajout des fichiers binaires)
-          git add -f trading_journal.xlsx portfolio_state.json cache_news.json 2>/dev/null || true
+          # Ajouter tous les fichiers nouveaux et modifiés (inclut xlsx, json, etc.)
+          git add -f .
 
           # git status --porcelain est fiable pour tous types de fichiers (texte ET binaires)
           # Les lignes ne commençant pas par '??' sont des changements stagés
