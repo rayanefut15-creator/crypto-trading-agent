@@ -22,7 +22,7 @@ import json         # Sauvegarder des données dans des fichiers texte
 import requests     # Appeler l'API NewsData.io
 import anthropic    # Utiliser l'IA Claude pour analyser les news
 import openpyxl     # Lire et écrire des fichiers Excel
-from datetime import datetime   # Gérer les dates et heures
+from datetime import datetime, timezone   # Gérer les dates et heures
 from dotenv import load_dotenv  # Lire le fichier .env (clés secrètes)
 
 # ─────────────────────────────────────────────────────────────
@@ -66,7 +66,7 @@ TAKE_PROFIT_PCT  = 0.08    # Take-profit à +8% au-dessus du prix d'achat
 
 def log(message: str):
     """Affiche un message dans la console avec la date et l'heure."""
-    heure = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    heure = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{heure}] {message}")
 
 
@@ -487,7 +487,7 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
         for article in news[:5]
     ) or "Aucune news"
 
-    maintenant = datetime.now()
+    maintenant = datetime.now(timezone.utc)
     nouvelle_ligne = [
         maintenant.strftime("%Y-%m-%d"),
         maintenant.strftime("%H:%M:%S"),
