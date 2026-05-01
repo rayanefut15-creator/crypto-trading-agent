@@ -59,10 +59,23 @@ FRAIS_TRADING    = 0.001   # 0.1% de frais Binance par trade (achat ET vente)
 STOP_LOSS_PCT    = 0.05    # Stop-loss à -5% sous le prix d'achat
 TAKE_PROFIT_PCT  = 0.08    # Take-profit à +8% au-dessus du prix d'achat
 
+# Kill-switch budgétaire (coûts API Claude)
+LIMITE_COUT_QUOTIDIEN_USD = 1.00          # Arrêt automatique au-delà de 1 $/jour
+FICHIER_TOKEN_USAGE       = "token_usage.json"
+COUTS_PAR_TOKEN = {
+    # Prix Anthropic en $ par token (https://www.anthropic.com/pricing)
+    "claude-haiku-4-5-20251001": {"input": 0.80e-6, "output": 4.00e-6},
+    "claude-sonnet-4-6":         {"input": 3.00e-6, "output": 15.00e-6},
+}
+
 
 # ═════════════════════════════════════════════════════════════
 #  FONCTIONS UTILITAIRES
 # ═════════════════════════════════════════════════════════════
+
+class LimiteQuotidienneAtteinte(Exception):
+    """Levée quand le coût API Claude dépasse LIMITE_COUT_QUOTIDIEN_USD sur la journée UTC."""
+
 
 def log(message: str):
     """Affiche un message dans la console avec la date et l'heure."""
@@ -210,6 +223,56 @@ def recuperer_prix_btc() -> float:
 
 
 # ─────────────────────────────────────────────────────────────
+#  COMPTEUR DE TOKENS / KILL-SWITCH BUDGÉTAIRE
+# ─────────────────────────────────────────────────────────────
+
+def charger_usage_quotidien() -> dict:
+    """
+    Charge le compteur de dépenses API du jour (UTC).
+    Remet à zéro automatiquement si la date a changé.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if os.path.exists(FICHIER_TOKEN_USAGE):
+        with open(FICHIER_TOKEN_USAGE) as f:
+            data = json.load(f)
+        if data.get("date") == today:
+            return data
+    return {"date": today, "cout_total_usd": 0.0, "nb_appels": 0}
+
+
+def enregistrer_et_verifier_tokens(modele: str, input_tokens: int, output_tokens: int) -> float:
+    """
+    Comptabilise les tokens du dernier appel Claude, sauvegarde, et déclenche le
+    kill-switch si la limite quotidienne est atteinte.
+
+    Retourne le coût de l'appel en USD.
+    Lève LimiteQuotidienneAtteinte si le total dépasse LIMITE_COUT_QUOTIDIEN_USD.
+    """
+    tarifs   = COUTS_PAR_TOKEN.get(modele, {"input": 3.00e-6, "output": 15.00e-6})
+    cout_appel = input_tokens * tarifs["input"] + output_tokens * tarifs["output"]
+
+    usage = charger_usage_quotidien()
+    usage["cout_total_usd"] += cout_appel
+    usage["nb_appels"]      += 1
+
+    with open(FICHIER_TOKEN_USAGE, "w") as f:
+        json.dump(usage, f, indent=2)
+
+    pct = usage["cout_total_usd"] / LIMITE_COUT_QUOTIDIEN_USD * 100
+    log(f"💳 Appel : ${cout_appel:.4f} | Jour : ${usage['cout_total_usd']:.4f} "
+        f"/ ${LIMITE_COUT_QUOTIDIEN_USD:.2f} ({pct:.1f}%)")
+
+    if usage["cout_total_usd"] >= LIMITE_COUT_QUOTIDIEN_USD:
+        raise LimiteQuotidienneAtteinte(
+            f"Limite quotidienne de ${LIMITE_COUT_QUOTIDIEN_USD:.2f} atteinte "
+            f"(total: ${usage['cout_total_usd']:.4f} en {usage['nb_appels']} appels). "
+            "Agent arrêté pour éviter une surfacturation."
+        )
+
+    return cout_appel
+
+
+# ─────────────────────────────────────────────────────────────
 #  ÉTAPE 3 & 4 : ANALYSE IA AVEC CLAUDE (Anthropic)
 # ─────────────────────────────────────────────────────────────
 
@@ -259,6 +322,14 @@ Guide de scoring :
 - -5 à -8  : signal baissier notable        → VENDRE
 - -9 à -10 : signal baissier exceptionnel  → VENDRE"""
 
+    # ── Vérifier le budget avant tout appel ──
+    usage = charger_usage_quotidien()
+    if usage["cout_total_usd"] >= LIMITE_COUT_QUOTIDIEN_USD:
+        raise LimiteQuotidienneAtteinte(
+            f"Limite quotidienne de ${LIMITE_COUT_QUOTIDIEN_USD:.2f} déjà atteinte "
+            f"(${usage['cout_total_usd']:.4f}). Aucun appel Claude émis."
+        )
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     # ── Première analyse avec Haiku (rapide et économique) ──
@@ -270,6 +341,9 @@ Guide de scoring :
             max_tokens=512,
             messages=[{"role": "user", "content": prompt_analyse}]
         )
+        enregistrer_et_verifier_tokens(
+            MODELE_HAIKU, reponse.usage.input_tokens, reponse.usage.output_tokens
+        )
         contenu = reponse.content[0].text.strip()
 
         # Extraire le JSON de la réponse (Claude peut parfois ajouter du texte autour)
@@ -280,9 +354,10 @@ Guide de scoring :
         resultat = json.loads(contenu_json)
         resultat["modele_utilise"] = MODELE_HAIKU
 
+    except LimiteQuotidienneAtteinte:
+        raise  # Laisser remonter jusqu'au kill-switch dans main()
     except Exception as e:
         log(f"⚠️  Erreur avec Haiku : {e}")
-        # En cas d'erreur, on retourne une réponse neutre par sécurité
         return {
             "score": 0,
             "recommandation": "ATTENDRE",
@@ -310,6 +385,9 @@ Confirme ou nuance cette évaluation avec tes propres conclusions."""
                 max_tokens=1024,
                 messages=[{"role": "user", "content": prompt_approfondi}]
             )
+            enregistrer_et_verifier_tokens(
+                MODELE_SONNET, reponse_sonnet.usage.input_tokens, reponse_sonnet.usage.output_tokens
+            )
             contenu = reponse_sonnet.content[0].text.strip()
             debut   = contenu.find("{")
             fin     = contenu.rfind("}") + 1
@@ -319,6 +397,8 @@ Confirme ou nuance cette évaluation avec tes propres conclusions."""
             resultat["modele_utilise"] = MODELE_SONNET
             log(f"📊 Score Sonnet : {int(resultat.get('score', 0)):+d}/10 → {resultat.get('recommandation')}")
 
+        except LimiteQuotidienneAtteinte:
+            raise  # Laisser remonter jusqu'au kill-switch dans main()
         except Exception as e:
             # En cas d'erreur avec Sonnet, on garde le résultat Haiku
             log(f"⚠️  Erreur avec Sonnet, on conserve l'analyse Haiku : {e}")
@@ -618,6 +698,10 @@ def main():
     log(f"   Frais trading            : {FRAIS_TRADING*100:.1f}% par trade")
     log(f"   Stop-loss                : -{STOP_LOSS_PCT*100:.0f}%")
     log(f"   Take-profit              : +{TAKE_PROFIT_PCT*100:.0f}%")
+    log(f"   Limite coût API/jour     : ${LIMITE_COUT_QUOTIDIEN_USD:.2f}")
+    usage_actuel = charger_usage_quotidien()
+    log(f"   Dépense API aujourd'hui  : ${usage_actuel['cout_total_usd']:.4f} "
+        f"({usage_actuel['nb_appels']} appels)")
     log("=" * 55)
     log("")
 
@@ -653,6 +737,9 @@ def main():
         log("\n▶  Exécution du cycle unique (mode GitHub Actions)...")
         try:
             executer_un_cycle(portefeuille)
+        except LimiteQuotidienneAtteinte as e:
+            log(f"🚨 KILL-SWITCH BUDGÉTAIRE : {e}")
+            sys.exit(1)
         except Exception as e:
             log(f"❌ Erreur : {e}")
             import traceback
@@ -674,6 +761,9 @@ def main():
             portefeuille = executer_un_cycle(portefeuille)
         except KeyboardInterrupt:
             log("\n⛔ Arrêt demandé (Ctrl+C). À bientôt !")
+            break
+        except LimiteQuotidienneAtteinte as e:
+            log(f"🚨 KILL-SWITCH BUDGÉTAIRE : {e}")
             break
         except Exception as e:
             log(f"❌ Erreur inattendue : {e}")
