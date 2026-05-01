@@ -51,8 +51,8 @@ TAILLE_MAX_CACHE     = 300           # Nombre max d'IDs de news à mémoriser
 MODELE_HAIKU  = "claude-haiku-4-5-20251001"  # Rapide et économique
 MODELE_SONNET = "claude-sonnet-4-6"           # Plus puissant (signaux forts)
 
-# Seuil pour utiliser Sonnet au lieu de Haiku (signal très fort)
-SEUIL_SIGNAL_FORT = 8  # Score > 8 ou < -8 → analyse approfondie avec Sonnet
+# Seuil pour choisir Sonnet : nombre minimum de news pertinentes détectées par Haiku
+SEUIL_NEWS_PERTINENTES = 2  # ≥ 2 news pertinentes → Sonnet ; sinon → Haiku
 
 # Paramètres de gestion du risque
 FRAIS_TRADING    = 0.001   # 0.1% de frais Binance par trade (achat ET vente)
@@ -285,39 +285,115 @@ def enregistrer_et_verifier_tokens(modele: str, input_tokens: int, output_tokens
 
 
 # ─────────────────────────────────────────────────────────────
-#  ÉTAPE 3 & 4 : ANALYSE IA AVEC CLAUDE (Anthropic)
+#  ÉTAPE 3 : PRÉ-FILTRAGE DES NEWS PAR HAIKU
+# ─────────────────────────────────────────────────────────────
+
+def prefiltrer_news_haiku(articles: list, client: anthropic.Anthropic) -> list:
+    """
+    Haiku évalue chaque news avec une question oui/non :
+    "Cette news peut-elle impacter le prix du BTC dans les 24h ?"
+
+    Retourne uniquement les articles jugés pertinents.
+    En cas d'erreur, retourne tous les articles (fallback).
+    """
+    if not articles:
+        return []
+
+    liste_titres = ""
+    for i, article in enumerate(articles, 1):
+        liste_titres += f"\n{i}. {article.get('title', 'Sans titre')}"
+
+    prompt_filtre = f"""Pour chaque news ci-dessous, réponds OUI ou NON :
+"Cette news peut-elle impacter le prix du BTC dans les 24 prochaines heures ?"
+
+NEWS :{liste_titres}
+
+Réponds UNIQUEMENT avec un objet JSON valide (rien d'autre autour) :
+{{
+  "filtres": [true, false, true, ...]
+}}
+true = OUI (news pertinente), false = NON. L'ordre doit correspondre à la liste."""
+
+    try:
+        reponse = client.messages.create(
+            model=MODELE_HAIKU,
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt_filtre}]
+        )
+        enregistrer_et_verifier_tokens(
+            MODELE_HAIKU, reponse.usage.input_tokens, reponse.usage.output_tokens
+        )
+        contenu = reponse.content[0].text.strip()
+        debut = contenu.find("{")
+        fin   = contenu.rfind("}") + 1
+        contenu_json = contenu[debut:fin] if debut >= 0 and fin > debut else contenu
+        filtres = json.loads(contenu_json).get("filtres", [])
+
+        news_pertinentes = [a for a, ok in zip(articles, filtres) if ok]
+        log(f"🔍 Pré-filtrage Haiku : {len(news_pertinentes)}/{len(articles)} news pertinentes pour le BTC")
+        return news_pertinentes
+
+    except LimiteQuotidienneAtteinte:
+        raise
+    except Exception as e:
+        log(f"⚠️  Erreur pré-filtrage Haiku ({e}) — toutes les news conservées")
+        return articles
+
+
+# ─────────────────────────────────────────────────────────────
+#  ÉTAPE 4 : DÉCISION FINALE (Haiku ou Sonnet selon le filtre)
 # ─────────────────────────────────────────────────────────────
 
 def analyser_avec_claude(prix_btc: float, news: list) -> dict:
     """
-    Envoie le prix BTC et les news à Claude pour une analyse de sentiment.
-
-    Logique de choix du modèle :
-    - Par défaut      → Haiku (rapide, économique)
-    - Score fort ≥ 8  → Sonnet (plus puissant, analyse approfondie)
+    Pipeline d'analyse en deux étapes :
+    1. Haiku pré-filtre chaque news (oui/non : impact BTC dans 24h ?)
+    2. Si ≥ SEUIL_NEWS_PERTINENTES news pertinentes → Sonnet décide
+       Sinon → Haiku décide directement
 
     Retourne un dictionnaire avec :
       - "score"          : de -10 (très baissier) à +10 (très haussier)
       - "recommandation" : "ACHETER", "VENDRE" ou "ATTENDRE"
       - "explication"    : 2-3 phrases d'explication
-      - "modele_utilise" : nom du modèle Claude ayant produit le résultat
+      - "modele_utilise" : nom du modèle Claude ayant pris la décision finale
     """
+    usage = charger_usage_quotidien()
+    if usage["cout_total_usd"] >= LIMITE_COUT_QUOTIDIEN_USD:
+        raise LimiteQuotidienneAtteinte(
+            f"Limite quotidienne de ${LIMITE_COUT_QUOTIDIEN_USD:.2f} déjà atteinte "
+            f"(${usage['cout_total_usd']:.4f}). Aucun appel Claude émis."
+        )
 
-    # Préparer un résumé lisible des news pour le prompt
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # ── Étape 1 : Pré-filtrage Haiku ──
+    news_pertinentes = prefiltrer_news_haiku(news, client)
+    nb_pertinentes   = len(news_pertinentes)
+
+    # ── Choix du modèle décisionnel ──
+    if nb_pertinentes >= SEUIL_NEWS_PERTINENTES:
+        modele_decision = MODELE_SONNET
+        log(f"📡 {nb_pertinentes} news pertinentes → décision confiée à {MODELE_SONNET}")
+    else:
+        modele_decision = MODELE_HAIKU
+        log(f"📡 {nb_pertinentes} news pertinente(s) → décision par {MODELE_HAIKU}")
+
+    # Utiliser les news pertinentes si disponibles, sinon toutes (fallback 0 pertinente)
+    news_pour_analyse = news_pertinentes if news_pertinentes else news
+
     resume_news = ""
-    for i, article in enumerate(news[:5], 1):  # Max 5 news pour limiter les coûts
+    for i, article in enumerate(news_pour_analyse[:5], 1):
         titre    = article.get("title", "Sans titre")
         source   = article.get("source_id", "Source inconnue")
         date_pub = article.get("pubDate", "")
         resume_news += f"\n{i}. [{date_pub}] {titre} (Source: {source})"
 
-    # Prompt envoyé à Claude — instructions claires et format de réponse imposé
     prompt_analyse = f"""Tu es un analyste de trading crypto expérimenté et prudent.
 Analyse les informations suivantes et donne une recommandation de trading BTC.
 
 PRIX ACTUEL DU BITCOIN : {prix_btc:,.2f} USDT
 
-DERNIÈRES NEWS CRYPTO :
+NEWS PERTINENTES CRYPTO ({nb_pertinentes} sélectionnées sur {len(news)}) :
 {resume_news}
 
 Réponds UNIQUEMENT avec un objet JSON valide dans ce format exact (rien d'autre autour) :
@@ -334,86 +410,38 @@ Guide de scoring :
 - -5 à -8  : signal baissier notable        → VENDRE
 - -9 à -10 : signal baissier exceptionnel  → VENDRE"""
 
-    # ── Vérifier le budget avant tout appel ──
-    usage = charger_usage_quotidien()
-    if usage["cout_total_usd"] >= LIMITE_COUT_QUOTIDIEN_USD:
-        raise LimiteQuotidienneAtteinte(
-            f"Limite quotidienne de ${LIMITE_COUT_QUOTIDIEN_USD:.2f} déjà atteinte "
-            f"(${usage['cout_total_usd']:.4f}). Aucun appel Claude émis."
-        )
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    # ── Première analyse avec Haiku (rapide et économique) ──
-    log(f"🤖 Analyse en cours avec {MODELE_HAIKU}...")
+    log(f"🤖 Décision en cours avec {modele_decision}...")
 
     try:
         reponse = client.messages.create(
-            model=MODELE_HAIKU,
-            max_tokens=512,
+            model=modele_decision,
+            max_tokens=512 if modele_decision == MODELE_HAIKU else 1024,
             messages=[{"role": "user", "content": prompt_analyse}]
         )
         enregistrer_et_verifier_tokens(
-            MODELE_HAIKU, reponse.usage.input_tokens, reponse.usage.output_tokens
+            modele_decision, reponse.usage.input_tokens, reponse.usage.output_tokens
         )
         contenu = reponse.content[0].text.strip()
-
-        # Extraire le JSON de la réponse (Claude peut parfois ajouter du texte autour)
-        debut = contenu.find("{")
-        fin   = contenu.rfind("}") + 1
+        debut   = contenu.find("{")
+        fin     = contenu.rfind("}") + 1
         contenu_json = contenu[debut:fin] if debut >= 0 and fin > debut else contenu
 
         resultat = json.loads(contenu_json)
-        resultat["modele_utilise"] = MODELE_HAIKU
+        resultat["modele_utilise"] = modele_decision
+        score = int(resultat.get("score", 0))
+        nom_modele = "Sonnet" if modele_decision == MODELE_SONNET else "Haiku"
+        log(f"📊 Score {nom_modele} : {score:+d}/10 → {resultat.get('recommandation')}")
 
     except LimiteQuotidienneAtteinte:
-        raise  # Laisser remonter jusqu'au kill-switch dans main()
+        raise
     except Exception as e:
-        log(f"⚠️  Erreur avec Haiku : {e}")
+        log(f"⚠️  Erreur avec {modele_decision} : {e}")
         return {
             "score": 0,
             "recommandation": "ATTENDRE",
             "explication": "Analyse impossible suite à une erreur technique. Par prudence : ATTENDRE.",
-            "modele_utilise": MODELE_HAIKU,
+            "modele_utilise": modele_decision,
         }
-
-    score = int(resultat.get("score", 0))
-    log(f"📊 Score Haiku : {score:+d}/10 → {resultat.get('recommandation')}")
-
-    # ── Si signal très fort, relancer avec Sonnet pour confirmer ──
-    if abs(score) >= SEUIL_SIGNAL_FORT:
-        log(f"🔥 Signal fort (score={score:+d}) → Analyse approfondie avec {MODELE_SONNET}...")
-
-        prompt_approfondi = prompt_analyse + f"""
-
-⚠️  ANALYSE APPROFONDIE DEMANDÉE
-Une première analyse a donné un score de {score:+d}/10.
-C'est un signal fort. Sois particulièrement rigoureux et prudent.
-Confirme ou nuance cette évaluation avec tes propres conclusions."""
-
-        try:
-            reponse_sonnet = client.messages.create(
-                model=MODELE_SONNET,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt_approfondi}]
-            )
-            enregistrer_et_verifier_tokens(
-                MODELE_SONNET, reponse_sonnet.usage.input_tokens, reponse_sonnet.usage.output_tokens
-            )
-            contenu = reponse_sonnet.content[0].text.strip()
-            debut   = contenu.find("{")
-            fin     = contenu.rfind("}") + 1
-            contenu_json = contenu[debut:fin] if debut >= 0 and fin > debut else contenu
-
-            resultat = json.loads(contenu_json)
-            resultat["modele_utilise"] = MODELE_SONNET
-            log(f"📊 Score Sonnet : {int(resultat.get('score', 0)):+d}/10 → {resultat.get('recommandation')}")
-
-        except LimiteQuotidienneAtteinte:
-            raise  # Laisser remonter jusqu'au kill-switch dans main()
-        except Exception as e:
-            # En cas d'erreur avec Sonnet, on garde le résultat Haiku
-            log(f"⚠️  Erreur avec Sonnet, on conserve l'analyse Haiku : {e}")
 
     log(f"💬 Explication : {resultat.get('explication', '')}")
     return resultat
@@ -706,7 +734,7 @@ def main():
         log(f"   Mode : local (boucle toutes les {INTERVALLE_SECONDES // 60} min)")
     log(f"   Capital fictif de départ : {CAPITAL_DEPART_USDT:.2f} USDT")
     log(f"   Fichier Excel            : {FICHIER_EXCEL}")
-    log(f"   Seuil signal fort        : ±{SEUIL_SIGNAL_FORT}/10 → Sonnet")
+    log(f"   Seuil news pertinentes   : ≥{SEUIL_NEWS_PERTINENTES} → Sonnet décide")
     log(f"   Frais trading            : {FRAIS_TRADING*100:.1f}% par trade")
     log(f"   Stop-loss                : -{STOP_LOSS_PCT*100:.0f}%")
     log(f"   Take-profit              : +{TAKE_PROFIT_PCT*100:.0f}%")
