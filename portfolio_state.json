@@ -1,7 +1,7 @@
 {
-  "usdt_disponible": 0.0,
-  "btc_en_stock": 0.0038844505444704846,
-  "en_position": true,
-  "prix_achat_btc": 77231.0,
+  "usdt_disponible": 303.7512663684272,
+  "btc_en_stock": 0.0,
+  "en_position": false,
+  "prix_achat_btc": 0.0,
   "prix_initial_bh": 76974.0
 }
