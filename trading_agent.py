@@ -54,6 +54,11 @@ MODELE_SONNET = "claude-sonnet-4-6"           # Plus puissant (signaux forts)
 # Seuil pour utiliser Sonnet au lieu de Haiku (signal très fort)
 SEUIL_SIGNAL_FORT = 8  # Score > 8 ou < -8 → analyse approfondie avec Sonnet
 
+# Paramètres de gestion du risque
+FRAIS_TRADING    = 0.001   # 0.1% de frais Binance par trade (achat ET vente)
+STOP_LOSS_PCT    = 0.05    # Stop-loss à -5% sous le prix d'achat
+TAKE_PROFIT_PCT  = 0.08    # Take-profit à +8% au-dessus du prix d'achat
+
 
 # ═════════════════════════════════════════════════════════════
 #  FONCTIONS UTILITAIRES
@@ -76,7 +81,9 @@ def charger_portfolio() -> dict:
     """
     if os.path.exists(FICHIER_PORTFOLIO):
         with open(FICHIER_PORTFOLIO, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        data.setdefault("prix_initial_bh", 0.0)  # Rétrocompatibilité
+        return data
 
     # Premier lancement : portefeuille initial
     return {
@@ -84,6 +91,7 @@ def charger_portfolio() -> dict:
         "btc_en_stock":    0.0,                   # Quantité de BTC détenue
         "en_position":     False,                  # True si on a du BTC en cours
         "prix_achat_btc":  0.0,                   # Prix d'achat fictif du BTC
+        "prix_initial_bh": 0.0,                   # Prix d'achat B&H (1er cycle valide)
     }
 
 
@@ -326,49 +334,66 @@ Confirme ou nuance cette évaluation avec tes propres conclusions."""
 def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float) -> tuple:
     """
     Simule un achat ou une vente de BTC selon la recommandation de Claude.
+    Applique les frais Binance (0.1%), le stop-loss (-5%) et le take-profit (+8%).
     ⚠️  AUCUN ordre réel n'est envoyé à Binance — 100% fictif.
 
     Retourne : (description_action, portefeuille_mis_à_jour)
     """
     action = "AUCUNE ACTION"
+    raison_vente = ""  # Préfixe "STOP-LOSS" ou "TAKE-PROFIT" si déclenché automatiquement
+
+    # ── Vérification Stop-Loss / Take-Profit (prioritaire sur la recommandation IA) ──
+    if portefeuille["en_position"] and portefeuille["prix_achat_btc"] > 0:
+        variation = prix_btc / portefeuille["prix_achat_btc"] - 1
+        if variation <= -STOP_LOSS_PCT:
+            log(f"🛑 STOP-LOSS déclenché ({variation*100:+.1f}%) → vente forcée")
+            recommandation = "VENDRE"
+            raison_vente = "[STOP-LOSS] "
+        elif variation >= TAKE_PROFIT_PCT:
+            log(f"🎯 TAKE-PROFIT déclenché ({variation*100:+.1f}%) → vente forcée")
+            recommandation = "VENDRE"
+            raison_vente = "[TAKE-PROFIT] "
 
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
-        # ── Simuler un achat ──
-        # On investit tout le capital USDT disponible en BTC
+        # ── Simuler un achat avec frais ──
         capital = portefeuille["usdt_disponible"]
-        btc_achete = capital / prix_btc  # Quantité de BTC fictive achetée
+        frais = round(capital * FRAIS_TRADING, 4)
+        btc_achete = (capital - frais) / prix_btc  # Frais déduits avant achat
 
         portefeuille["btc_en_stock"]   = btc_achete
         portefeuille["en_position"]     = True
         portefeuille["prix_achat_btc"]  = prix_btc
-        portefeuille["usdt_disponible"] = 0.0  # Tout l'argent est "investi"
+        portefeuille["usdt_disponible"] = 0.0
 
         action = (f"📈 ACHAT FICTIF : {btc_achete:.6f} BTC "
-                  f"à {prix_btc:,.2f} USDT (investi: {capital:.2f} USDT)")
+                  f"à {prix_btc:,.2f} USDT (investi: {capital:.2f} USDT, frais: {frais:.2f} USDT)")
         log(action)
 
     elif recommandation == "VENDRE" and portefeuille["en_position"]:
-        # ── Simuler une vente ──
-        valeur_vente  = portefeuille["btc_en_stock"] * prix_btc
+        # ── Simuler une vente avec frais ──
+        valeur_brute  = portefeuille["btc_en_stock"] * prix_btc
+        frais         = round(valeur_brute * FRAIS_TRADING, 4)
+        valeur_vente  = valeur_brute - frais  # Frais déduits sur la vente
         cout_achat    = portefeuille["btc_en_stock"] * portefeuille["prix_achat_btc"]
-        pnl_trade     = valeur_vente - cout_achat  # Profit ou perte sur ce trade
+        pnl_trade     = valeur_vente - cout_achat
 
-        portefeuille["usdt_disponible"] = valeur_vente  # On récupère l'argent
+        portefeuille["usdt_disponible"] = valeur_vente
         portefeuille["btc_en_stock"]    = 0.0
         portefeuille["en_position"]      = False
         portefeuille["prix_achat_btc"]   = 0.0
 
         signe = "+" if pnl_trade >= 0 else ""
-        action = (f"📉 VENTE FICTIVE : {valeur_vente:.2f} USDT récupérés "
-                  f"(P&L trade: {signe}{pnl_trade:.2f} USDT)")
+        action = (f"{raison_vente}📉 VENTE FICTIVE : {valeur_vente:.2f} USDT récupérés "
+                  f"(frais: {frais:.2f} USDT | P&L trade: {signe}{pnl_trade:.2f} USDT)")
         log(action)
 
     else:
         # Aucune action : soit ATTENDRE, soit impossible (ex: ACHETER mais déjà en position)
         valeur_actuelle = calculer_valeur_portfolio(portefeuille, prix_btc)
         if portefeuille["en_position"]:
-            action = (f"⏳ EN POSITION — Valeur portfolio: {valeur_actuelle:.2f} USDT "
-                      f"(BTC en stock à {prix_btc:,.2f} USDT)")
+            variation = (prix_btc / portefeuille["prix_achat_btc"] - 1) * 100
+            action = (f"⏳ EN POSITION — Valeur: {valeur_actuelle:.2f} USDT "
+                      f"({variation:+.1f}% depuis achat à {portefeuille['prix_achat_btc']:,.0f} USDT)")
         else:
             action = f"⏳ EN ATTENTE — Capital disponible : {valeur_actuelle:.2f} USDT"
         log(action)
@@ -387,71 +412,96 @@ def calculer_valeur_portfolio(portefeuille: dict, prix_btc: float) -> float:
     return valeur
 
 
+def _calculer_valeur_bh(portefeuille: dict, prix_btc: float) -> float:
+    """Valeur du portfolio Buy & Hold de référence : achat fictif au 1er prix enregistré."""
+    prix_initial = portefeuille.get("prix_initial_bh", 0.0)
+    if prix_initial <= 0 or prix_btc <= 0:
+        return CAPITAL_DEPART_USDT
+    return CAPITAL_DEPART_USDT / prix_initial * prix_btc
+
+
 # ─────────────────────────────────────────────────────────────
 #  ÉTAPE 5 : ENREGISTREMENT DANS EXCEL
 # ─────────────────────────────────────────────────────────────
 
+EN_TETES_EXCEL = [
+    "Date",
+    "Heure",
+    "Prix BTC (USDT)",
+    "Nb news analysées",
+    "Titres des news",
+    "Score sentiment",
+    "Modèle Claude utilisé",
+    "Recommandation",
+    "Action simulée",
+    "Capital fictif (USDT)",
+    "P&L total (USDT)",
+    "Valeur B&H (USDT)",
+    "P&L B&H (USDT)",
+]
+
+
 def initialiser_excel():
     """
     Crée le fichier Excel avec les en-têtes si il n'existe pas encore.
-    Si le fichier existe déjà, ne fait rien (on continue à ajouter des lignes).
+    Si le fichier existe déjà, ajoute les colonnes B&H manquantes si nécessaire.
     """
-    if os.path.exists(FICHIER_EXCEL):
-        return  # Déjà existant, on ne le réinitialise pas
+    bold = openpyxl.styles.Font(bold=True)
 
-    classeur = openpyxl.Workbook()
+    if not os.path.exists(FICHIER_EXCEL):
+        classeur = openpyxl.Workbook()
+        feuille  = classeur.active
+        feuille.title = "Journal de Trading"
+        feuille.append(EN_TETES_EXCEL)
+        for cellule in feuille[1]:
+            cellule.font = bold
+        classeur.save(FICHIER_EXCEL)
+        log(f"📁 Fichier Excel créé : {FICHIER_EXCEL}")
+        return
+
+    # Migration : ajouter les colonnes B&H si absentes
+    classeur = openpyxl.load_workbook(FICHIER_EXCEL)
     feuille  = classeur.active
-    feuille.title = "Journal de Trading"
-
-    en_tetes = [
-        "Date",
-        "Heure",
-        "Prix BTC (USDT)",
-        "Nb news analysées",
-        "Titres des news",
-        "Score sentiment",
-        "Modèle Claude utilisé",
-        "Recommandation",
-        "Action simulée",
-        "Capital fictif (USDT)",
-        "P&L total (USDT)",
-    ]
-    feuille.append(en_tetes)
-
-    # Mettre les en-têtes en gras
-    for cellule in feuille[1]:
-        cellule.font = openpyxl.styles.Font(bold=True)
-
-    classeur.save(FICHIER_EXCEL)
-    log(f"📁 Fichier Excel créé : {FICHIER_EXCEL}")
+    en_tetes_actuels = [c.value for c in feuille[1]]
+    if "Valeur B&H (USDT)" not in en_tetes_actuels:
+        col = len(en_tetes_actuels) + 1
+        cell_bh  = feuille.cell(row=1, column=col,   value="Valeur B&H (USDT)")
+        cell_pnl = feuille.cell(row=1, column=col+1, value="P&L B&H (USDT)")
+        cell_bh.font  = bold
+        cell_pnl.font = bold
+        classeur.save(FICHIER_EXCEL)
+        log("📁 Colonnes Buy & Hold ajoutées au fichier Excel existant.")
 
 
 def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
-                            action: str, valeur_portfolio: float):
+                            action: str, valeur_portfolio: float, valeur_bh: float):
     """
-    Ajoute une nouvelle ligne dans le fichier Excel avec toutes les données du cycle.
+    Ajoute une nouvelle ligne dans le fichier Excel avec toutes les données du cycle,
+    y compris la comparaison avec la stratégie Buy & Hold.
     """
-    pnl_total = valeur_portfolio - CAPITAL_DEPART_USDT  # Gain ou perte depuis le départ
+    pnl_total = valeur_portfolio - CAPITAL_DEPART_USDT
+    pnl_bh    = valeur_bh - CAPITAL_DEPART_USDT
 
-    # Concaténer les titres des news (séparés par " | ")
     titres_news = " | ".join(
-        article.get("title", "Sans titre")[:80]  # Max 80 caractères par titre
+        article.get("title", "Sans titre")[:80]
         for article in news[:5]
     ) or "Aucune news"
 
-    maintenant  = datetime.now()
+    maintenant = datetime.now()
     nouvelle_ligne = [
-        maintenant.strftime("%Y-%m-%d"),           # Date
-        maintenant.strftime("%H:%M:%S"),            # Heure
-        round(prix_btc, 2),                         # Prix BTC
-        len(news),                                  # Nombre de news
-        titres_news,                                # Titres des news
-        analyse.get("score", 0),                    # Score sentiment
-        analyse.get("modele_utilise", "N/A"),        # Modèle Claude
-        analyse.get("recommandation", "ATTENDRE"),  # Recommandation
-        action,                                     # Action effectuée
-        round(valeur_portfolio, 2),                 # Capital actuel
-        round(pnl_total, 2),                        # P&L total depuis le départ
+        maintenant.strftime("%Y-%m-%d"),
+        maintenant.strftime("%H:%M:%S"),
+        round(prix_btc, 2),
+        len(news),
+        titres_news,
+        analyse.get("score", 0),
+        analyse.get("modele_utilise", "N/A"),
+        analyse.get("recommandation", "ATTENDRE"),
+        action,
+        round(valeur_portfolio, 2),
+        round(pnl_total, 2),
+        round(valeur_bh, 2),
+        round(pnl_bh, 2),
     ]
 
     classeur = openpyxl.load_workbook(FICHIER_EXCEL)
@@ -459,8 +509,9 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
     feuille.append(nouvelle_ligne)
     classeur.save(FICHIER_EXCEL)
 
-    signe = "+" if pnl_total >= 0 else ""
-    log(f"💾 Excel mis à jour — P&L total : {signe}{pnl_total:.2f} USDT")
+    signe_agent = "+" if pnl_total >= 0 else ""
+    signe_bh    = "+" if pnl_bh >= 0 else ""
+    log(f"💾 Excel — P&L agent : {signe_agent}{pnl_total:.2f} USDT | P&L B&H : {signe_bh}{pnl_bh:.2f} USDT")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -491,11 +542,13 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         log("💤 Pas de nouvelles news ce cycle — écriture heartbeat dans Excel.")
         prix_btc = recuperer_prix_btc()
         valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
+        valeur_bh = _calculer_valeur_bh(portefeuille, prix_btc)
         enregistrer_dans_excel(
             prix_btc, [],
             {"score": 0, "recommandation": "ATTENDRE", "modele_utilise": "—"},
             "ATTENDRE",
             valeur_portfolio,
+            valeur_bh,
         )
         return portefeuille
 
@@ -504,6 +557,11 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     if prix_btc == 0.0:
         log("⚠️  Prix BTC indisponible — cycle annulé par sécurité.")
         return portefeuille
+
+    # ── Initialiser le prix de référence Buy & Hold au premier cycle valide ──
+    if portefeuille.get("prix_initial_bh", 0.0) == 0.0:
+        portefeuille["prix_initial_bh"] = prix_btc
+        log(f"📊 Prix de référence Buy & Hold initialisé : {prix_btc:,.2f} USDT")
 
     # ── Étapes 3 & 4 : Analyser avec Claude ──
     analyse = analyser_avec_claude(prix_btc, nouvelles_news)
@@ -517,11 +575,15 @@ def executer_un_cycle(portefeuille: dict) -> dict:
 
     # ── Étape 5 : Enregistrer dans Excel ──
     valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
-    enregistrer_dans_excel(prix_btc, nouvelles_news, analyse, action, valeur_portfolio)
+    valeur_bh = _calculer_valeur_bh(portefeuille, prix_btc)
+    enregistrer_dans_excel(prix_btc, nouvelles_news, analyse, action, valeur_portfolio, valeur_bh)
 
     pnl = valeur_portfolio - CAPITAL_DEPART_USDT
-    signe = "+" if pnl >= 0 else ""
-    log(f"💼 Portfolio : {valeur_portfolio:.2f} USDT (départ: {CAPITAL_DEPART_USDT:.2f} | P&L: {signe}{pnl:.2f})")
+    pnl_bh = valeur_bh - CAPITAL_DEPART_USDT
+    signe    = "+" if pnl >= 0 else ""
+    signe_bh = "+" if pnl_bh >= 0 else ""
+    log(f"💼 Agent : {valeur_portfolio:.2f} USDT (P&L: {signe}{pnl:.2f}) | "
+        f"B&H : {valeur_bh:.2f} USDT (P&L: {signe_bh}{pnl_bh:.2f})")
 
     return portefeuille
 
@@ -553,6 +615,9 @@ def main():
     log(f"   Capital fictif de départ : {CAPITAL_DEPART_USDT:.2f} USDT")
     log(f"   Fichier Excel            : {FICHIER_EXCEL}")
     log(f"   Seuil signal fort        : ±{SEUIL_SIGNAL_FORT}/10 → Sonnet")
+    log(f"   Frais trading            : {FRAIS_TRADING*100:.1f}% par trade")
+    log(f"   Stop-loss                : -{STOP_LOSS_PCT*100:.0f}%")
+    log(f"   Take-profit              : +{TAKE_PROFIT_PCT*100:.0f}%")
     log("=" * 55)
     log("")
 
