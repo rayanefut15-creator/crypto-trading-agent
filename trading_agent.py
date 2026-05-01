@@ -199,16 +199,18 @@ def recuperer_nouvelles_news() -> list:
 
 
 # ─────────────────────────────────────────────────────────────
-#  ÉTAPE 2 : RÉCUPÉRATION DU PRIX BTC (CoinGecko API publique)
+#  ÉTAPE 2 : RÉCUPÉRATION DU PRIX BTC (CoinGecko → Binance en backup)
 # ─────────────────────────────────────────────────────────────
 
 def recuperer_prix_btc() -> float:
     """
-    Récupère le prix actuel du Bitcoin via l'API publique CoinGecko.
-    Aucune clé API requise — fonctionne depuis n'importe quel serveur.
+    Récupère le prix actuel du Bitcoin.
+    Source primaire  : CoinGecko (API publique, sans clé)
+    Source de backup : Binance ticker public (sans clé)
 
-    Retourne : le prix en float (ex: 68234.50) ou 0.0 si erreur.
+    Retourne : le prix en float (ex: 68234.50) ou 0.0 si les deux sources échouent.
     """
+    # ── Source 1 : CoinGecko ──
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
         reponse = requests.get(url, timeout=10)
@@ -216,9 +218,19 @@ def recuperer_prix_btc() -> float:
         prix = float(reponse.json()["bitcoin"]["usd"])
         log(f"💰 Prix actuel du BTC : {prix:,.2f} USD (CoinGecko)")
         return prix
-
     except Exception as e:
-        log(f"⚠️  Erreur récupération prix BTC : {e}")
+        log(f"⚠️  CoinGecko indisponible ({e}) — tentative Binance...")
+
+    # ── Source 2 : Binance ticker public (backup) ──
+    try:
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+        reponse = requests.get(url, timeout=10)
+        reponse.raise_for_status()
+        prix = float(reponse.json()["price"])
+        log(f"💰 Prix actuel du BTC : {prix:,.2f} USD (Binance backup)")
+        return prix
+    except Exception as e:
+        log(f"⚠️  Binance indisponible ({e}) — prix BTC introuvable.")
         return 0.0
 
 
