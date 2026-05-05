@@ -2,7 +2,7 @@
 #  GITHUB ACTIONS — Agent de Trading Crypto
 # ─────────────────────────────────────────────────────────────
 #
-#  Ce fichier dit à GitHub quoi faire toutes les 30 minutes :
+#  Ce fichier dit à GitHub quoi faire toutes les 15 minutes :
 #  1. Télécharger ton code depuis GitHub
 #  2. Installer Python et les bibliothèques
 #  3. Lancer UN cycle d'analyse (trading_agent.py --once)
@@ -13,11 +13,11 @@
 name: 🤖 Agent de Trading Crypto
 
 on:
-  # ── Déclenchement automatique toutes les 30 minutes ──
+  # ── Déclenchement automatique toutes les 15 minutes ──
   # Format cron : minute heure jour mois jour_semaine
-  # */30 * * * * = toutes les 30 minutes (à HH:00 et HH:30)
+  # */15 * * * * = toutes les 15 minutes (à HH:00, HH:15, HH:30, HH:45)
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/15 * * * *'
 
   # ── Déclenchement manuel depuis l'interface GitHub ──
   # Utile pour tester sans attendre 30 min
@@ -33,9 +33,9 @@ jobs:
     # Utiliser une machine virtuelle Ubuntu (gratuite sur GitHub)
     runs-on: ubuntu-latest
 
-    # Sécurité : tuer le job si ça dure plus de 10 minutes
+    # Sécurité : tuer le job si ça dure plus de 15 minutes
     # (normalement un cycle dure 1-2 minutes max)
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       # ── Étape 1 : Télécharger le code depuis GitHub ──
@@ -59,7 +59,6 @@ jobs:
       - name: 🔄 Lancer un cycle d'analyse
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          NEWSDATA_API_KEY:  ${{ secrets.NEWSDATA_API_KEY }}
           BINANCE_API_KEY:   ${{ secrets.BINANCE_API_KEY }}
           BINANCE_SECRET:    ${{ secrets.BINANCE_SECRET }}
         run: python trading_agent.py --once

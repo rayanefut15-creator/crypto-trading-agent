@@ -4,7 +4,7 @@
 =============================================================
   AGENT DE TRADING CRYPTO — PAPER TRADING (ARGENT FICTIF)
 =============================================================
-Ce script surveille les nouvelles crypto toutes les 30 minutes,
+Ce script surveille les nouvelles crypto toutes les 15 minutes,
 analyse leur sentiment avec l'IA Claude (Anthropic), et simule
 des décisions de trading BTC avec un capital fictif de 300 USDT.
 
@@ -19,7 +19,8 @@ import os           # Lire les variables d'environnement
 import sys          # Lire les arguments passés au script (ex: --once)
 import time         # Faire des pauses entre les cycles
 import json         # Sauvegarder des données dans des fichiers texte
-import requests     # Appeler l'API NewsData.io
+import feedparser   # Lire les flux RSS (CoinDesk, Cointelegraph)
+import requests     # Récupérer le prix BTC (CoinGecko / Binance)
 import anthropic    # Utiliser l'IA Claude pour analyser les news
 import openpyxl     # Lire et écrire des fichiers Excel
 from datetime import datetime, timezone   # Gérer les dates et heures
@@ -35,17 +36,29 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")   # Clé pour l'IA Claude
 BINANCE_API_KEY   = os.getenv("BINANCE_API_KEY")      # Clé Binance (lecture prix)
 BINANCE_SECRET    = os.getenv("BINANCE_SECRET")       # Secret Binance
-NEWSDATA_API_KEY  = os.getenv("NEWSDATA_API_KEY")     # Clé pour les news crypto
 
 # ─────────────────────────────────────────────────────────────
 #  PARAMÈTRES GÉNÉRAUX (tu peux les modifier ici)
 # ─────────────────────────────────────────────────────────────
 CAPITAL_DEPART_USDT  = 300.0         # Capital fictif de départ (en USDT ≈ EUR)
-INTERVALLE_SECONDES  = 30 * 60       # 30 minutes entre chaque vérification
+INTERVALLE_SECONDES  = 15 * 60       # 15 minutes entre chaque vérification
 FICHIER_EXCEL        = "trading_journal.xlsx"   # Nom du fichier Excel
 FICHIER_CACHE_NEWS   = "cache_news.json"         # Mémorisation des news déjà vues
 FICHIER_PORTFOLIO    = "portfolio_state.json"    # Sauvegarde du portefeuille fictif
-TAILLE_MAX_CACHE     = 300           # Nombre max d'IDs de news à mémoriser
+CACHE_EXPIRY_JOURS   = 7             # Expirer les news du cache après 7 jours
+
+# Sources RSS
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+]
+
+# Mots indicateurs de spam/publicité (filtre insensible à la casse)
+MOTS_SPAM = {
+    "casino", "presale", "pre-sale", "100x", "alphapepe", "pepeto",
+    "gambling", "airdrop", "giveaway", "prize", "sponsor",
+    "advertisement", "promoted",
+}
 
 # Modèles Claude
 MODELE_HAIKU  = "claude-haiku-4-5-20251001"  # Rapide et économique
@@ -118,80 +131,99 @@ def sauvegarder_portfolio(portefeuille: dict):
 #  GESTION DU CACHE DES NEWS (mémoriser les news déjà vues)
 # ─────────────────────────────────────────────────────────────
 
-def charger_cache_news() -> list:
+def charger_cache_news() -> dict:
     """
-    Charge la liste des IDs de news déjà analysées.
-    Si le fichier cache n'existe pas, retourne une liste vide.
+    Charge le cache des news : dict {url: timestamp_unix}.
+    Expire automatiquement les entrées de plus de CACHE_EXPIRY_JOURS jours.
+    Gère la migration depuis l'ancien format (liste d'IDs).
     """
     if not os.path.exists(FICHIER_CACHE_NEWS):
-        return []
+        return {}
     with open(FICHIER_CACHE_NEWS, "r") as f:
-        return json.load(f)
+        try:
+            cache = json.load(f)
+        except json.JSONDecodeError:
+            return {}
+    if isinstance(cache, list):
+        return {}  # Migration depuis l'ancien format liste → dict vide
+    limite = time.time() - CACHE_EXPIRY_JOURS * 86400
+    return {url: ts for url, ts in cache.items() if ts > limite}
 
 
-def sauvegarder_cache_news(ids: list):
-    """
-    Sauvegarde les IDs de news dans le fichier cache.
-    Garde uniquement les TAILLE_MAX_CACHE derniers IDs pour éviter un fichier trop grand.
-    """
-    ids_a_garder = ids[-TAILLE_MAX_CACHE:]  # Ne garder que les plus récents
+def sauvegarder_cache_news(cache: dict):
+    """Sauvegarde le cache {url: timestamp_unix} dans le fichier JSON."""
     with open(FICHIER_CACHE_NEWS, "w") as f:
-        json.dump(ids_a_garder, f)
+        json.dump(cache, f)
 
 
 # ─────────────────────────────────────────────────────────────
-#  ÉTAPE 1 : RÉCUPÉRATION DES NEWS (NewsData.io)
+#  ÉTAPE 1 : RÉCUPÉRATION DES NEWS (RSS CoinDesk + Cointelegraph)
 # ─────────────────────────────────────────────────────────────
+
+def _contient_spam(texte: str) -> bool:
+    """Retourne True si le texte contient un mot de la liste MOTS_SPAM."""
+    texte_lower = texte.lower()
+    return any(mot in texte_lower for mot in MOTS_SPAM)
+
 
 def recuperer_nouvelles_news() -> list:
     """
-    Appelle l'API NewsData.io pour récupérer les dernières news crypto.
-    Compare avec le cache pour ne retourner QUE les news pas encore vues.
-
-    Retourne : liste de news (vide si aucune nouvelle depuis la dernière vérification).
+    Lit les flux RSS CoinDesk et Cointelegraph, filtre le spam,
+    déduplique par titre normalisé et compare avec le cache (URL comme clé)
+    pour ne retourner que les articles pas encore vus.
     """
-    log("Vérification des news sur NewsData.io...")
+    log("Vérification des news RSS (CoinDesk + Cointelegraph)...")
 
-    url = "https://newsdata.io/api/1/news"
-    parametres = {
-        "apikey":   NEWSDATA_API_KEY,
-        "q":        "bitcoin cryptocurrency BTC",  # Mots-clés de recherche
-        "language": "en",                           # Anglais (meilleure couverture)
-        "category": "business,technology",          # Catégories pertinentes
-        "size":     10,                             # Max 10 articles par appel
-    }
+    tous_articles = []
+    for feed_url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries:
+                titre = entry.get("title", "").strip()
+                lien  = entry.get("link", "").strip()
+                if not titre or not lien:
+                    continue
+                tous_articles.append({
+                    "title":     titre,
+                    "link":      lien,
+                    "source_id": feed.feed.get("title", feed_url),
+                    "pubDate":   entry.get("published", ""),
+                    "summary":   entry.get("summary", ""),
+                })
+        except Exception as e:
+            log(f"⚠️  Erreur lecture RSS {feed_url} : {e}")
 
-    try:
-        reponse = requests.get(url, params=parametres, timeout=20)
-        reponse.raise_for_status()   # Lève une erreur si le code HTTP n'est pas 200
-        donnees = reponse.json()
-    except requests.RequestException as e:
-        log(f"⚠️  Erreur appel NewsData.io : {e}")
-        return []
+    # Filtre anti-spam sur titre et résumé
+    articles_filtres = [
+        a for a in tous_articles
+        if not _contient_spam(a["title"]) and not _contient_spam(a.get("summary", ""))
+    ]
 
-    if donnees.get("status") != "success":
-        message_erreur = donnees.get("message", "inconnu")
-        log(f"⚠️  Réponse inattendue NewsData.io : {message_erreur}")
-        return []
+    # Déduplique par titre normalisé (même article repris des deux sources)
+    titres_vus: set = set()
+    articles_uniques = []
+    for article in articles_filtres:
+        titre_norm = article["title"].lower().strip()
+        if titre_norm not in titres_vus:
+            titres_vus.add(titre_norm)
+            articles_uniques.append(article)
 
-    articles = donnees.get("results", [])
+    # Filtre anti-doublons via le cache (URL comme identifiant unique)
+    cache = charger_cache_news()
+    maintenant = time.time()
 
-    # Charger les IDs des news déjà analysées
-    ids_deja_vus = charger_cache_news()
-
-    # Garder uniquement les news qu'on n'a pas encore vues
     nouvelles_news = []
-    nouveaux_ids   = []
-    for article in articles:
-        article_id = article.get("article_id", "")
-        if article_id and article_id not in ids_deja_vus:
+    for article in articles_uniques:
+        url = article["link"]
+        if url not in cache:
             nouvelles_news.append(article)
-            nouveaux_ids.append(article_id)
+            cache[url] = maintenant
 
-    # Mettre à jour le cache avec les nouveaux IDs
-    if nouveaux_ids:
-        sauvegarder_cache_news(ids_deja_vus + nouveaux_ids)
-        log(f"✅ {len(nouvelles_news)} nouvelle(s) news détectée(s) !")
+    sauvegarder_cache_news(cache)
+
+    if nouvelles_news:
+        log(f"✅ {len(nouvelles_news)} nouvelle(s) news détectée(s) "
+            f"({len(articles_filtres)} après filtre spam, {len(articles_uniques)} après dédup)")
     else:
         log("Aucune nouvelle news depuis la dernière vérification. En attente...")
 
@@ -288,31 +320,37 @@ def enregistrer_et_verifier_tokens(modele: str, input_tokens: int, output_tokens
 #  ÉTAPE 3 : PRÉ-FILTRAGE DES NEWS PAR HAIKU
 # ─────────────────────────────────────────────────────────────
 
-def prefiltrer_news_haiku(articles: list, client: anthropic.Anthropic) -> list:
+def prefiltrer_news_haiku(articles: list, client: anthropic.Anthropic) -> tuple:
     """
-    Haiku évalue chaque news avec une question oui/non :
-    "Cette news peut-elle impacter le prix du BTC dans les 24h ?"
+    Haiku note chaque news de 0 à 3 :
+      0 = pub / spam / hors sujet
+      1 = news crypto générale (altcoins, NFT, DeFi sans lien BTC)
+      2 = news crypto directement pertinente pour le prix du BTC
+      3 = news macro importante (Fed, inflation, régulation, ETF Bitcoin)
 
-    Retourne uniquement les articles jugés pertinents.
-    En cas d'erreur, retourne tous les articles (fallback).
+    Retourne (articles_qualite_2_3, nb_qualite).
+    En cas d'erreur, retourne (articles, len(articles)) en fallback.
     """
     if not articles:
-        return []
+        return [], 0
 
     liste_titres = ""
     for i, article in enumerate(articles, 1):
         liste_titres += f"\n{i}. {article.get('title', 'Sans titre')}"
 
-    prompt_filtre = f"""Pour chaque news ci-dessous, réponds OUI ou NON :
-"Cette news peut-elle impacter le prix du BTC dans les 24 prochaines heures ?"
+    prompt_filtre = f"""Note chaque news de 0 à 3 selon son importance pour le trading BTC :
+  0 = pub / spam / hors sujet crypto
+  1 = news crypto générale (altcoins, NFT, DeFi sans lien BTC)
+  2 = news crypto directement pertinente pour le prix du BTC
+  3 = news macro importante (Fed, inflation, régulation, ETF Bitcoin, crise financière)
 
 NEWS :{liste_titres}
 
 Réponds UNIQUEMENT avec un objet JSON valide (rien d'autre autour) :
 {{
-  "filtres": [true, false, true, ...]
+  "scores": [2, 0, 3, 1, ...]
 }}
-true = OUI (news pertinente), false = NON. L'ordre doit correspondre à la liste."""
+L'ordre doit correspondre exactement à la liste. Chaque score est 0, 1, 2 ou 3."""
 
     try:
         reponse = client.messages.create(
@@ -327,17 +365,20 @@ true = OUI (news pertinente), false = NON. L'ordre doit correspondre à la liste
         debut = contenu.find("{")
         fin   = contenu.rfind("}") + 1
         contenu_json = contenu[debut:fin] if debut >= 0 and fin > debut else contenu
-        filtres = json.loads(contenu_json).get("filtres", [])
+        scores = json.loads(contenu_json).get("scores", [])
 
-        news_pertinentes = [a for a, ok in zip(articles, filtres) if ok]
-        log(f"🔍 Pré-filtrage Haiku : {len(news_pertinentes)}/{len(articles)} news pertinentes pour le BTC")
-        return news_pertinentes
+        news_qualite = [a for a, s in zip(articles, scores) if s >= 2]
+        nb_qualite   = len(news_qualite)
+        nb_niveau3   = sum(1 for s in scores if s == 3)
+        log(f"🔍 Scoring Haiku : {nb_qualite}/{len(articles)} news qualité 2-3 "
+            f"({nb_niveau3} niveau 3 macro)")
+        return news_qualite, nb_qualite
 
     except LimiteQuotidienneAtteinte:
         raise
     except Exception as e:
-        log(f"⚠️  Erreur pré-filtrage Haiku ({e}) — toutes les news conservées")
-        return articles
+        log(f"⚠️  Erreur scoring Haiku ({e}) — toutes les news conservées")
+        return articles, len(articles)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -366,17 +407,17 @@ def analyser_avec_claude(prix_btc: float, news: list) -> dict:
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    # ── Étape 1 : Pré-filtrage Haiku ──
-    news_pertinentes = prefiltrer_news_haiku(news, client)
-    nb_pertinentes   = len(news_pertinentes)
+    # ── Étape 1 : Scoring Haiku (0-3) ──
+    news_pertinentes, nb_qualite = prefiltrer_news_haiku(news, client)
+    nb_pertinentes = nb_qualite
 
     # ── Choix du modèle décisionnel ──
     if nb_pertinentes >= SEUIL_NEWS_PERTINENTES:
         modele_decision = MODELE_SONNET
-        log(f"📡 {nb_pertinentes} news pertinentes → décision confiée à {MODELE_SONNET}")
+        log(f"📡 {nb_pertinentes} news qualité 2-3 → décision confiée à {MODELE_SONNET}")
     else:
         modele_decision = MODELE_HAIKU
-        log(f"📡 {nb_pertinentes} news pertinente(s) → décision par {MODELE_HAIKU}")
+        log(f"📡 {nb_pertinentes} news qualité 2-3 → décision par {MODELE_HAIKU}")
 
     # Utiliser les news pertinentes si disponibles, sinon toutes (fallback 0 pertinente)
     news_pour_analyse = news_pertinentes if news_pertinentes else news
@@ -393,7 +434,7 @@ Analyse les informations suivantes et donne une recommandation de trading BTC.
 
 PRIX ACTUEL DU BITCOIN : {prix_btc:,.2f} USDT
 
-NEWS PERTINENTES CRYPTO ({nb_pertinentes} sélectionnées sur {len(news)}) :
+NEWS QUALITÉ 2-3 ({nb_qualite} sélectionnées sur {len(news)}) :
 {resume_news}
 
 Réponds UNIQUEMENT avec un objet JSON valide dans ce format exact (rien d'autre autour) :
@@ -428,6 +469,7 @@ Guide de scoring :
 
         resultat = json.loads(contenu_json)
         resultat["modele_utilise"] = modele_decision
+        resultat["nb_qualite"]     = nb_qualite
         score = int(resultat.get("score", 0))
         nom_modele = "Sonnet" if modele_decision == MODELE_SONNET else "Haiku"
         log(f"📊 Score {nom_modele} : {score:+d}/10 → {resultat.get('recommandation')}")
@@ -441,6 +483,7 @@ Guide de scoring :
             "recommandation": "ATTENDRE",
             "explication": "Analyse impossible suite à une erreur technique. Par prudence : ATTENDRE.",
             "modele_utilise": modele_decision,
+            "nb_qualite":     nb_qualite,
         }
 
     log(f"💬 Explication : {resultat.get('explication', '')}")
@@ -558,6 +601,7 @@ EN_TETES_EXCEL = [
     "P&L total (USDT)",
     "Valeur B&H (USDT)",
     "P&L B&H (USDT)",
+    "News qualité 2-3",
 ]
 
 
@@ -590,7 +634,14 @@ def initialiser_excel():
         cell_bh.font  = bold
         cell_pnl.font = bold
         classeur.save(FICHIER_EXCEL)
+        en_tetes_actuels = [c.value for c in feuille[1]]
         log("📁 Colonnes Buy & Hold ajoutées au fichier Excel existant.")
+    if "News qualité 2-3" not in en_tetes_actuels:
+        col = len(en_tetes_actuels) + 1
+        cell = feuille.cell(row=1, column=col, value="News qualité 2-3")
+        cell.font = bold
+        classeur.save(FICHIER_EXCEL)
+        log("📁 Colonne 'News qualité 2-3' ajoutée au fichier Excel existant.")
 
 
 def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
@@ -622,6 +673,7 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
         round(pnl_total, 2),
         round(valeur_bh, 2),
         round(pnl_bh, 2),
+        analyse.get("nb_qualite", 0),
     ]
 
     classeur = openpyxl.load_workbook(FICHIER_EXCEL)
@@ -665,7 +717,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         valeur_bh = _calculer_valeur_bh(portefeuille, prix_btc)
         enregistrer_dans_excel(
             prix_btc, [],
-            {"score": 0, "recommandation": "ATTENDRE", "modele_utilise": "—"},
+            {"score": 0, "recommandation": "ATTENDRE", "modele_utilise": "—", "nb_qualite": 0},
             "ATTENDRE",
             valeur_portfolio,
             valeur_bh,
@@ -717,10 +769,10 @@ def main():
     Lance l'agent de trading.
 
     Deux modes de fonctionnement :
-    - Mode local (Mac)           : boucle infinie, attend 30 min entre chaque cycle
+    - Mode local (Mac)           : boucle infinie, attend 15 min entre chaque cycle
                                    → lance avec : python3 trading_agent.py
     - Mode GitHub Actions (--once) : exécute UN seul cycle puis s'arrête
-                                   → GitHub Actions relance le script toutes les 30 min
+                                   → GitHub Actions relance le script toutes les 15 min
                                    → lance avec : python3 trading_agent.py --once
     """
     # Détecter si on est en mode "un seul cycle" (GitHub Actions)
@@ -734,7 +786,7 @@ def main():
         log(f"   Mode : local (boucle toutes les {INTERVALLE_SECONDES // 60} min)")
     log(f"   Capital fictif de départ : {CAPITAL_DEPART_USDT:.2f} USDT")
     log(f"   Fichier Excel            : {FICHIER_EXCEL}")
-    log(f"   Seuil news pertinentes   : ≥{SEUIL_NEWS_PERTINENTES} → Sonnet décide")
+    log(f"   Seuil news qualité 2-3   : ≥{SEUIL_NEWS_PERTINENTES} → Sonnet décide")
     log(f"   Frais trading            : {FRAIS_TRADING*100:.1f}% par trade")
     log(f"   Stop-loss                : -{STOP_LOSS_PCT*100:.0f}%")
     log(f"   Take-profit              : +{TAKE_PROFIT_PCT*100:.0f}%")
@@ -745,18 +797,12 @@ def main():
     log("=" * 55)
     log("")
 
-    # ── Vérification que les clés API sont bien renseignées ──
-    cles_manquantes = []
-    if not ANTHROPIC_API_KEY: cles_manquantes.append("ANTHROPIC_API_KEY")
-    if not NEWSDATA_API_KEY:  cles_manquantes.append("NEWSDATA_API_KEY")
-
-    if cles_manquantes:
-        log(f"❌ ERREUR : Clés API manquantes :")
-        for cle in cles_manquantes:
-            log(f"   • {cle}")
+    # ── Vérification que la clé API Anthropic est bien renseignée ──
+    if not ANTHROPIC_API_KEY:
+        log("❌ ERREUR : Clé API manquante : ANTHROPIC_API_KEY")
         log("   En local : remplis le fichier .env")
-        log("   Sur GitHub : ajoute les secrets dans Settings → Secrets → Actions")
-        sys.exit(1)  # Quitter avec une erreur pour signaler l'échec à GitHub Actions
+        log("   Sur GitHub : ajoute le secret dans Settings → Secrets → Actions")
+        sys.exit(1)
 
     if not BINANCE_API_KEY:
         log("ℹ️  Pas de clé Binance — le prix BTC sera quand même récupéré (lecture publique).")
@@ -789,7 +835,7 @@ def main():
         return
 
     # ════════════════════════════════════════════
-    #  MODE LOCAL : boucle infinie toutes les 30 min
+    #  MODE LOCAL : boucle infinie toutes les 15 min
     # ════════════════════════════════════════════
     numero_cycle = 0
     while True:

@@ -2,6 +2,7 @@
 # Installe tout avec : pip install -r requirements.txt
 
 anthropic>=0.40.0        # API Claude (IA Anthropic)
-requests>=2.31.0         # Appels HTTP vers NewsData.io
+feedparser>=6.0.11       # Lecture des flux RSS (CoinDesk, Cointelegraph)
+requests>=2.31.0         # Appels HTTP (prix BTC via CoinGecko / Binance)
 python-dotenv>=1.0.0     # Lecture du fichier .env (clés secrètes)
 openpyxl>=3.1.2          # Lecture/écriture de fichiers Excel
