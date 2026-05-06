@@ -86,6 +86,7 @@ jobs:
             echo "📝 Changements détectés :"
             echo "$CHANGES"
             git commit -m "📊 Cycle du $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git pull --rebase origin main || true
             git push
             echo "✅ Fichiers sauvegardés dans GitHub."
           fi
