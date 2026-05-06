@@ -338,6 +338,24 @@ def recuperer_donnees_marche_btc() -> dict:
         return {}
 
 
+def recuperer_fear_greed() -> dict:
+    """
+    Récupère le Fear & Greed Index crypto via alternative.me (API gratuite).
+    Retourne {"valeur": int, "classification": str} ou {} en cas d'erreur.
+    """
+    try:
+        reponse = requests.get("https://api.alternative.me/fng/", timeout=10)
+        reponse.raise_for_status()
+        data = reponse.json()["data"][0]
+        valeur = int(data["value"])
+        classification = data["value_classification"]
+        log(f"😱 Fear & Greed Index : {valeur}/100 ({classification})")
+        return {"valeur": valeur, "classification": classification}
+    except Exception as e:
+        log(f"⚠️  Fear & Greed Index indisponible ({e})")
+        return {}
+
+
 # ─────────────────────────────────────────────────────────────
 #  COMPTEUR DE TOKENS / KILL-SWITCH BUDGÉTAIRE
 # ─────────────────────────────────────────────────────────────
@@ -514,6 +532,12 @@ def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None)
     min_24h = marche.get("min_24h", 0.0)
     max_24h = marche.get("max_24h", 0.0)
 
+    # Fear & Greed Index
+    fg = recuperer_fear_greed()
+    fg_valeur = fg.get("valeur", None)
+    fg_classification = fg.get("classification", "N/A")
+    fg_str = f"{fg_valeur}/100 ({fg_classification})" if fg_valeur is not None else "N/A"
+
     # P&L latent si en position
     pnl_latent_str = "N/A"
     if portefeuille and portefeuille.get("en_position") and portefeuille.get("prix_achat_btc", 0) > 0:
@@ -524,8 +548,24 @@ def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None)
     contexte_technique = (
         f"Prix actuel: {prix_btc:,.0f}$ | Var 1h: {var_1h:+.2f}% | "
         f"Var 24h: {var_24h:+.2f}% | Var 7j: {var_7j:+.2f}%\n"
-        f"Min/Max 24h: {min_24h:,.0f}$/{max_24h:,.0f}$ | P&L latent: {pnl_latent_str}"
+        f"Min/Max 24h: {min_24h:,.0f}$/{max_24h:,.0f}$ | P&L latent: {pnl_latent_str}\n"
+        f"Fear & Greed Index: {fg_str}"
     )
+
+    # ── Format de réponse JSON selon le modèle ──
+    if modele_decision == MODELE_SONNET:
+        format_json = """{
+  "analyse_preliminaire": "<2-3 phrases de raisonnement sur les news et le contexte de marché>",
+  "score": <nombre entier entre -10 et 10>,
+  "recommandation": "<ACHETER ou VENDRE ou ATTENDRE>",
+  "confiance": <entier de 1 (faible) à 5 (très élevé)>
+}"""
+    else:
+        format_json = """{
+  "score": <nombre entier entre -10 et 10>,
+  "recommandation": "<ACHETER ou VENDRE ou ATTENDRE>",
+  "explication": "<2-3 phrases expliquant ta décision en français>"
+}"""
 
     prompt_analyse = f"""Tu es un analyste de trading crypto expérimenté et prudent.
 Analyse les informations suivantes et donne une recommandation de trading BTC.
@@ -537,11 +577,7 @@ NEWS QUALITÉ 2-3 ({nb_qualite} sélectionnées sur {len(news)}) :
 {resume_news}
 
 Réponds UNIQUEMENT avec un objet JSON valide dans ce format exact (rien d'autre autour) :
-{{
-  "score": <nombre entier entre -10 et 10>,
-  "recommandation": "<ACHETER ou VENDRE ou ATTENDRE>",
-  "explication": "<2-3 phrases expliquant ta décision en français>"
-}}
+{format_json}
 
 Guide de scoring :
 - +9 à +10 : signal haussier exceptionnel  → ACHETER
@@ -567,25 +603,34 @@ Guide de scoring :
         contenu_json = contenu[debut:fin] if debut >= 0 and fin > debut else contenu
 
         resultat = json.loads(contenu_json)
-        resultat["modele_utilise"] = modele_decision
-        resultat["nb_qualite"]     = nb_qualite
+        resultat["modele_utilise"]      = modele_decision
+        resultat["nb_qualite"]          = nb_qualite
+        resultat["fear_greed_valeur"]   = fg_valeur
+        resultat["fear_greed_label"]    = fg_classification
         score = int(resultat.get("score", 0))
         nom_modele = "Sonnet" if modele_decision == MODELE_SONNET else "Haiku"
-        log(f"📊 Score {nom_modele} : {score:+d}/10 → {resultat.get('recommandation')}")
+        log(f"📊 Score {nom_modele} : {score:+d}/10 → {resultat.get('recommandation')} "
+            f"(confiance: {resultat.get('confiance', '—')}/5)")
+        if resultat.get("analyse_preliminaire"):
+            log(f"🧠 Raisonnement : {resultat['analyse_preliminaire']}")
 
     except LimiteQuotidienneAtteinte:
         raise
     except Exception as e:
         log(f"⚠️  Erreur avec {modele_decision} : {e}")
         return {
-            "score":           0,
-            "recommandation":  "ATTENDRE",
-            "explication":     "Analyse impossible suite à une erreur technique. Par prudence : ATTENDRE.",
-            "modele_utilise":  modele_decision,
-            "nb_qualite":      nb_qualite,
+            "score":                0,
+            "recommandation":       "ATTENDRE",
+            "explication":          "Analyse impossible suite à une erreur technique. Par prudence : ATTENDRE.",
+            "modele_utilise":       modele_decision,
+            "nb_qualite":           nb_qualite,
+            "fear_greed_valeur":    fg_valeur,
+            "fear_greed_label":     fg_classification,
+            "analyse_preliminaire": "",
+            "confiance":            0,
         }
 
-    log(f"💬 Explication : {resultat.get('explication', '')}")
+    log(f"💬 Explication : {resultat.get('explication', resultat.get('analyse_preliminaire', ''))}")
     return resultat
 
 
@@ -775,6 +820,8 @@ EN_TETES_EXCEL = [
     "Valeur B&H (USDT)",
     "P&L B&H (USDT)",
     "News qualité 2-3",
+    "Raisonnement Claude",
+    "Fear & Greed",
 ]
 
 
@@ -810,7 +857,16 @@ def initialiser_excel():
         cell = feuille.cell(row=1, column=col, value="News qualité 2-3")
         cell.font = bold
         classeur.save(FICHIER_EXCEL)
+        en_tetes_actuels = [c.value for c in feuille[1]]
         log("📁 Colonne 'News qualité 2-3' ajoutée au fichier Excel existant.")
+    for col_name in ("Raisonnement Claude", "Fear & Greed"):
+        if col_name not in en_tetes_actuels:
+            col = len(en_tetes_actuels) + 1
+            cell = feuille.cell(row=1, column=col, value=col_name)
+            cell.font = bold
+            classeur.save(FICHIER_EXCEL)
+            en_tetes_actuels = [c.value for c in feuille[1]]
+            log(f"📁 Colonne '{col_name}' ajoutée au fichier Excel existant.")
 
 
 def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
@@ -823,6 +879,10 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
         article.get("title", "Sans titre")[:80]
         for article in news[:5]
     ) or "Aucune news"
+
+    fg_valeur = analyse.get("fear_greed_valeur", None)
+    fg_label  = analyse.get("fear_greed_label", "")
+    fg_excel  = f"{fg_valeur}/100 ({fg_label})" if fg_valeur is not None else "N/A"
 
     maintenant = datetime.now(timezone.utc)
     nouvelle_ligne = [
@@ -840,6 +900,8 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
         round(valeur_bh, 2),
         round(pnl_bh, 2),
         analyse.get("nb_qualite", 0),
+        analyse.get("analyse_preliminaire", ""),
+        fg_excel,
     ]
 
     classeur = openpyxl.load_workbook(FICHIER_EXCEL)
