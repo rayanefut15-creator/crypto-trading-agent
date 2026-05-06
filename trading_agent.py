@@ -24,28 +24,32 @@ import requests     # Récupérer le prix BTC (CoinGecko / Binance)
 import anthropic    # Utiliser l'IA Claude pour analyser les news
 import openpyxl     # Lire et écrire des fichiers Excel
 from datetime import datetime, timezone   # Gérer les dates et heures
+from email.utils import parsedate_to_datetime  # Parser les dates RSS
 from dotenv import load_dotenv  # Lire le fichier .env (clés secrètes)
 
 # ─────────────────────────────────────────────────────────────
 #  CHARGEMENT DES CLÉS API DEPUIS LE FICHIER .env
 # ─────────────────────────────────────────────────────────────
-# Le fichier .env contient tes clés secrètes.
-# On ne les écrit JAMAIS directement dans le code !
 load_dotenv()
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")   # Clé pour l'IA Claude
-BINANCE_API_KEY   = os.getenv("BINANCE_API_KEY")      # Clé Binance (lecture prix)
-BINANCE_SECRET    = os.getenv("BINANCE_SECRET")       # Secret Binance
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+BINANCE_API_KEY   = os.getenv("BINANCE_API_KEY")
+BINANCE_SECRET    = os.getenv("BINANCE_SECRET")
 
 # ─────────────────────────────────────────────────────────────
-#  PARAMÈTRES GÉNÉRAUX (tu peux les modifier ici)
+#  PARAMÈTRES GÉNÉRAUX
 # ─────────────────────────────────────────────────────────────
-CAPITAL_DEPART_USDT  = 300.0         # Capital fictif de départ (en USDT ≈ EUR)
-INTERVALLE_SECONDES  = 15 * 60       # 15 minutes entre chaque vérification
-FICHIER_EXCEL        = "trading_journal.xlsx"   # Nom du fichier Excel
-FICHIER_CACHE_NEWS   = "cache_news.json"         # Mémorisation des news déjà vues
-FICHIER_PORTFOLIO    = "portfolio_state.json"    # Sauvegarde du portefeuille fictif
-CACHE_EXPIRY_JOURS   = 7             # Expirer les news du cache après 7 jours
+CAPITAL_DEPART_USDT      = 300.0
+INTERVALLE_SECONDES      = 15 * 60
+FICHIER_EXCEL            = "trading_journal.xlsx"
+FICHIER_CACHE_NEWS       = "cache_news.json"
+FICHIER_PORTFOLIO        = "portfolio_state.json"
+FICHIER_HISTORIQUE_TRADES = "trades_history.json"
+CACHE_EXPIRY_JOURS       = 7
+
+COOLDOWN_POST_TRADE_S    = 4 * 3600   # 4h minimum entre trade opposé
+MAX_TRADES_PAR_JOUR      = 4          # Maximum de trades par 24h
+FILTRE_AGE_MAX_SECONDES  = 6 * 3600   # Ignorer les news de plus de 6h
 
 # Sources RSS
 RSS_FEEDS = [
@@ -53,30 +57,24 @@ RSS_FEEDS = [
     "https://cointelegraph.com/rss",
 ]
 
-# Mots indicateurs de spam/publicité (filtre insensible à la casse)
 MOTS_SPAM = {
     "casino", "presale", "pre-sale", "100x", "alphapepe", "pepeto",
     "gambling", "airdrop", "giveaway", "prize", "sponsor",
     "advertisement", "promoted",
 }
 
-# Modèles Claude
-MODELE_HAIKU  = "claude-haiku-4-5-20251001"  # Rapide et économique
-MODELE_SONNET = "claude-sonnet-4-6"           # Plus puissant (signaux forts)
+MODELE_HAIKU  = "claude-haiku-4-5-20251001"
+MODELE_SONNET = "claude-sonnet-4-6"
 
-# Seuil pour choisir Sonnet : nombre minimum de news pertinentes détectées par Haiku
-SEUIL_NEWS_PERTINENTES = 2  # ≥ 2 news pertinentes → Sonnet ; sinon → Haiku
+SEUIL_NEWS_PERTINENTES = 2
 
-# Paramètres de gestion du risque
-FRAIS_TRADING    = 0.001   # 0.1% de frais Binance par trade (achat ET vente)
-STOP_LOSS_PCT    = 0.05    # Stop-loss à -5% sous le prix d'achat
-TAKE_PROFIT_PCT  = 0.08    # Take-profit à +8% au-dessus du prix d'achat
+FRAIS_TRADING    = 0.001
+STOP_LOSS_PCT    = 0.05
+TAKE_PROFIT_PCT  = 0.08
 
-# Kill-switch budgétaire (coûts API Claude)
-LIMITE_COUT_QUOTIDIEN_USD = 1.00          # Arrêt automatique au-delà de 1 $/jour
+LIMITE_COUT_QUOTIDIEN_USD = 1.00
 FICHIER_TOKEN_USAGE       = "token_usage.json"
 COUTS_PAR_TOKEN = {
-    # Prix Anthropic en $ par token (https://www.anthropic.com/pricing)
     "claude-haiku-4-5-20251001": {"input": 0.80e-6, "output": 4.00e-6},
     "claude-sonnet-4-6":         {"input": 3.00e-6, "output": 15.00e-6},
 }
@@ -97,7 +95,7 @@ def log(message: str):
 
 
 # ─────────────────────────────────────────────────────────────
-#  GESTION DU PORTEFEUILLE FICTIF (sauvegarde entre redémarrages)
+#  GESTION DU PORTEFEUILLE FICTIF
 # ─────────────────────────────────────────────────────────────
 
 def charger_portfolio() -> dict:
@@ -108,16 +106,23 @@ def charger_portfolio() -> dict:
     if os.path.exists(FICHIER_PORTFOLIO):
         with open(FICHIER_PORTFOLIO, "r") as f:
             data = json.load(f)
-        data.setdefault("prix_initial_bh", 0.0)  # Rétrocompatibilité
+        data.setdefault("prix_initial_bh",       0.0)
+        data.setdefault("dernier_trade_timestamp", 0.0)
+        data.setdefault("dernier_trade_type",      "")
+        data.setdefault("trades_aujourd_hui",      0)
+        data.setdefault("date_trades",             "")
         return data
 
-    # Premier lancement : portefeuille initial
     return {
-        "usdt_disponible": CAPITAL_DEPART_USDT,  # Capital en USDT (pas encore investi)
-        "btc_en_stock":    0.0,                   # Quantité de BTC détenue
-        "en_position":     False,                  # True si on a du BTC en cours
-        "prix_achat_btc":  0.0,                   # Prix d'achat fictif du BTC
-        "prix_initial_bh": 0.0,                   # Prix d'achat B&H (1er cycle valide)
+        "usdt_disponible":         CAPITAL_DEPART_USDT,
+        "btc_en_stock":            0.0,
+        "en_position":             False,
+        "prix_achat_btc":          0.0,
+        "prix_initial_bh":         0.0,
+        "dernier_trade_timestamp": 0.0,
+        "dernier_trade_type":      "",
+        "trades_aujourd_hui":      0,
+        "date_trades":             "",
     }
 
 
@@ -128,14 +133,34 @@ def sauvegarder_portfolio(portefeuille: dict):
 
 
 # ─────────────────────────────────────────────────────────────
-#  GESTION DU CACHE DES NEWS (mémoriser les news déjà vues)
+#  GESTION DE L'HISTORIQUE DES TRADES
+# ─────────────────────────────────────────────────────────────
+
+def charger_historique_trades() -> list:
+    """Charge l'historique des trades depuis trades_history.json."""
+    if not os.path.exists(FICHIER_HISTORIQUE_TRADES):
+        return []
+    with open(FICHIER_HISTORIQUE_TRADES, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
+
+
+def sauvegarder_historique_trades(historique: list):
+    """Sauvegarde l'historique des trades dans trades_history.json."""
+    with open(FICHIER_HISTORIQUE_TRADES, "w") as f:
+        json.dump(historique, f, indent=2, default=str)
+
+
+# ─────────────────────────────────────────────────────────────
+#  GESTION DU CACHE DES NEWS
 # ─────────────────────────────────────────────────────────────
 
 def charger_cache_news() -> dict:
     """
     Charge le cache des news : dict {url: timestamp_unix}.
     Expire automatiquement les entrées de plus de CACHE_EXPIRY_JOURS jours.
-    Gère la migration depuis l'ancien format (liste d'IDs).
     """
     if not os.path.exists(FICHIER_CACHE_NEWS):
         return {}
@@ -145,7 +170,7 @@ def charger_cache_news() -> dict:
         except json.JSONDecodeError:
             return {}
     if isinstance(cache, list):
-        return {}  # Migration depuis l'ancien format liste → dict vide
+        return {}
     limite = time.time() - CACHE_EXPIRY_JOURS * 86400
     return {url: ts for url, ts in cache.items() if ts > limite}
 
@@ -166,11 +191,22 @@ def _contient_spam(texte: str) -> bool:
     return any(mot in texte_lower for mot in MOTS_SPAM)
 
 
+def _age_article_secondes(pub_date_str: str) -> float:
+    """Retourne l'âge en secondes d'un article depuis sa pubDate RSS."""
+    if not pub_date_str:
+        return 0.0
+    try:
+        dt = parsedate_to_datetime(pub_date_str)
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except Exception:
+        return 0.0
+
+
 def recuperer_nouvelles_news() -> list:
     """
     Lit les flux RSS CoinDesk et Cointelegraph, filtre le spam,
-    déduplique par titre normalisé et compare avec le cache (URL comme clé)
-    pour ne retourner que les articles pas encore vus.
+    ignore les articles de plus de 6h, déduplique par titre normalisé
+    et compare avec le cache pour ne retourner que les articles nouveaux.
     """
     log("Vérification des news RSS (CoinDesk + Cointelegraph)...")
 
@@ -193,13 +229,22 @@ def recuperer_nouvelles_news() -> list:
         except Exception as e:
             log(f"⚠️  Erreur lecture RSS {feed_url} : {e}")
 
+    # Filtre âge : ignorer les articles de plus de 6h
+    articles_recents = [
+        a for a in tous_articles
+        if _age_article_secondes(a.get("pubDate", "")) <= FILTRE_AGE_MAX_SECONDES
+    ]
+    nb_filtres_age = len(tous_articles) - len(articles_recents)
+    if nb_filtres_age > 0:
+        log(f"🕐 {nb_filtres_age} article(s) ignoré(s) car publiés il y a plus de 6h")
+
     # Filtre anti-spam sur titre et résumé
     articles_filtres = [
-        a for a in tous_articles
+        a for a in articles_recents
         if not _contient_spam(a["title"]) and not _contient_spam(a.get("summary", ""))
     ]
 
-    # Déduplique par titre normalisé (même article repris des deux sources)
+    # Déduplique par titre normalisé
     titres_vus: set = set()
     articles_uniques = []
     for article in articles_filtres:
@@ -208,7 +253,7 @@ def recuperer_nouvelles_news() -> list:
             titres_vus.add(titre_norm)
             articles_uniques.append(article)
 
-    # Filtre anti-doublons via le cache (URL comme identifiant unique)
+    # Filtre anti-doublons via le cache
     cache = charger_cache_news()
     maintenant = time.time()
 
@@ -231,18 +276,15 @@ def recuperer_nouvelles_news() -> list:
 
 
 # ─────────────────────────────────────────────────────────────
-#  ÉTAPE 2 : RÉCUPÉRATION DU PRIX BTC (CoinGecko → Binance en backup)
+#  ÉTAPE 2 : RÉCUPÉRATION DU PRIX BTC + DONNÉES MARCHÉ
 # ─────────────────────────────────────────────────────────────
 
 def recuperer_prix_btc() -> float:
     """
     Récupère le prix actuel du Bitcoin.
-    Source primaire  : CoinGecko (API publique, sans clé)
-    Source de backup : Binance ticker public (sans clé)
-
-    Retourne : le prix en float (ex: 68234.50) ou 0.0 si les deux sources échouent.
+    Source primaire  : CoinGecko
+    Source de backup : Binance ticker public
     """
-    # ── Source 1 : CoinGecko ──
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
         reponse = requests.get(url, timeout=10)
@@ -253,7 +295,6 @@ def recuperer_prix_btc() -> float:
     except Exception as e:
         log(f"⚠️  CoinGecko indisponible ({e}) — tentative Binance...")
 
-    # ── Source 2 : Binance ticker public (backup) ──
     try:
         url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
         reponse = requests.get(url, timeout=10)
@@ -266,15 +307,43 @@ def recuperer_prix_btc() -> float:
         return 0.0
 
 
+def recuperer_donnees_marche_btc() -> dict:
+    """
+    Récupère les données de marché BTC depuis CoinGecko :
+    - Variation 1h, 24h, 7j (en %)
+    - Prix min et max des dernières 24h
+
+    Retourne un dict avec les clés : prix, var_1h, var_24h, var_7j, min_24h, max_24h.
+    Retourne un dict vide en cas d'erreur.
+    """
+    try:
+        url = (
+            "https://api.coingecko.com/api/v3/coins/markets"
+            "?vs_currency=usd&ids=bitcoin"
+            "&price_change_percentage=1h,24h,7d"
+        )
+        reponse = requests.get(url, timeout=10)
+        reponse.raise_for_status()
+        data = reponse.json()[0]
+        return {
+            "prix":    data.get("current_price", 0.0),
+            "var_1h":  data.get("price_change_percentage_1h_in_currency", 0.0) or 0.0,
+            "var_24h": data.get("price_change_percentage_24h_in_currency", 0.0) or 0.0,
+            "var_7j":  data.get("price_change_percentage_7d_in_currency", 0.0) or 0.0,
+            "min_24h": data.get("low_24h", 0.0) or 0.0,
+            "max_24h": data.get("high_24h", 0.0) or 0.0,
+        }
+    except Exception as e:
+        log(f"⚠️  Données marché CoinGecko indisponibles ({e})")
+        return {}
+
+
 # ─────────────────────────────────────────────────────────────
 #  COMPTEUR DE TOKENS / KILL-SWITCH BUDGÉTAIRE
 # ─────────────────────────────────────────────────────────────
 
 def charger_usage_quotidien() -> dict:
-    """
-    Charge le compteur de dépenses API du jour (UTC).
-    Remet à zéro automatiquement si la date a changé.
-    """
+    """Charge le compteur de dépenses API du jour (UTC). Remet à zéro si la date a changé."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if os.path.exists(FICHIER_TOKEN_USAGE):
         with open(FICHIER_TOKEN_USAGE) as f:
@@ -288,11 +357,8 @@ def enregistrer_et_verifier_tokens(modele: str, input_tokens: int, output_tokens
     """
     Comptabilise les tokens du dernier appel Claude, sauvegarde, et déclenche le
     kill-switch si la limite quotidienne est atteinte.
-
-    Retourne le coût de l'appel en USD.
-    Lève LimiteQuotidienneAtteinte si le total dépasse LIMITE_COUT_QUOTIDIEN_USD.
     """
-    tarifs   = COUTS_PAR_TOKEN.get(modele, {"input": 3.00e-6, "output": 15.00e-6})
+    tarifs    = COUTS_PAR_TOKEN.get(modele, {"input": 3.00e-6, "output": 15.00e-6})
     cout_appel = input_tokens * tarifs["input"] + output_tokens * tarifs["output"]
 
     usage = charger_usage_quotidien()
@@ -328,11 +394,11 @@ def prefiltrer_news_haiku(articles: list, client: anthropic.Anthropic) -> tuple:
       2 = news crypto directement pertinente pour le prix du BTC
       3 = news macro importante (Fed, inflation, régulation, ETF Bitcoin)
 
-    Retourne (articles_qualite_2_3, nb_qualite).
-    En cas d'erreur, retourne (articles, len(articles)) en fallback.
+    Retourne (articles_qualite_2_3, nb_qualite, haiku_echec).
+    En cas d'erreur → ([], 0, True) : fail-safe, cycle forcé en ATTENDRE.
     """
     if not articles:
-        return [], 0
+        return [], 0, False
 
     liste_titres = ""
     for i, article in enumerate(articles, 1):
@@ -372,23 +438,23 @@ L'ordre doit correspondre exactement à la liste. Chaque score est 0, 1, 2 ou 3.
         nb_niveau3   = sum(1 for s in scores if s == 3)
         log(f"🔍 Scoring Haiku : {nb_qualite}/{len(articles)} news qualité 2-3 "
             f"({nb_niveau3} niveau 3 macro)")
-        return news_qualite, nb_qualite
+        return news_qualite, nb_qualite, False
 
     except LimiteQuotidienneAtteinte:
         raise
     except Exception as e:
-        log(f"⚠️  Erreur scoring Haiku ({e}) — toutes les news conservées")
-        return articles, len(articles)
+        log(f"⚠️  Erreur scoring Haiku ({e}) — cycle forcé en ATTENDRE (fail-safe)")
+        return [], 0, True
 
 
 # ─────────────────────────────────────────────────────────────
 #  ÉTAPE 4 : DÉCISION FINALE (Haiku ou Sonnet selon le filtre)
 # ─────────────────────────────────────────────────────────────
 
-def analyser_avec_claude(prix_btc: float, news: list) -> dict:
+def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None) -> dict:
     """
     Pipeline d'analyse en deux étapes :
-    1. Haiku pré-filtre chaque news (oui/non : impact BTC dans 24h ?)
+    1. Haiku pré-filtre chaque news (score 0-3 : impact BTC)
     2. Si ≥ SEUIL_NEWS_PERTINENTES news pertinentes → Sonnet décide
        Sinon → Haiku décide directement
 
@@ -408,7 +474,19 @@ def analyser_avec_claude(prix_btc: float, news: list) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     # ── Étape 1 : Scoring Haiku (0-3) ──
-    news_pertinentes, nb_qualite = prefiltrer_news_haiku(news, client)
+    news_pertinentes, nb_qualite, haiku_echec = prefiltrer_news_haiku(news, client)
+
+    # Fail-safe : si Haiku a échoué → ATTENDRE sans envoyer les news brutes
+    if haiku_echec:
+        log("🔒 Fail-safe Haiku actif → ATTENDRE forcé ce cycle")
+        return {
+            "score":           0,
+            "recommandation":  "ATTENDRE",
+            "explication":     "Pré-filtrage Haiku en échec — ATTENDRE par sécurité.",
+            "modele_utilise":  MODELE_HAIKU,
+            "nb_qualite":      0,
+        }
+
     nb_pertinentes = nb_qualite
 
     # ── Choix du modèle décisionnel ──
@@ -419,7 +497,6 @@ def analyser_avec_claude(prix_btc: float, news: list) -> dict:
         modele_decision = MODELE_HAIKU
         log(f"📡 {nb_pertinentes} news qualité 2-3 → décision par {MODELE_HAIKU}")
 
-    # Utiliser les news pertinentes si disponibles, sinon toutes (fallback 0 pertinente)
     news_pour_analyse = news_pertinentes if news_pertinentes else news
 
     resume_news = ""
@@ -429,10 +506,32 @@ def analyser_avec_claude(prix_btc: float, news: list) -> dict:
         date_pub = article.get("pubDate", "")
         resume_news += f"\n{i}. [{date_pub}] {titre} (Source: {source})"
 
+    # ── Récupérer le contexte technique de marché ──
+    marche = recuperer_donnees_marche_btc()
+    var_1h  = marche.get("var_1h",  0.0)
+    var_24h = marche.get("var_24h", 0.0)
+    var_7j  = marche.get("var_7j",  0.0)
+    min_24h = marche.get("min_24h", 0.0)
+    max_24h = marche.get("max_24h", 0.0)
+
+    # P&L latent si en position
+    pnl_latent_str = "N/A"
+    if portefeuille and portefeuille.get("en_position") and portefeuille.get("prix_achat_btc", 0) > 0:
+        pnl_pct = (prix_btc / portefeuille["prix_achat_btc"] - 1) * 100
+        signe = "+" if pnl_pct >= 0 else ""
+        pnl_latent_str = f"{signe}{pnl_pct:.1f}%"
+
+    contexte_technique = (
+        f"Prix actuel: {prix_btc:,.0f}$ | Var 1h: {var_1h:+.2f}% | "
+        f"Var 24h: {var_24h:+.2f}% | Var 7j: {var_7j:+.2f}%\n"
+        f"Min/Max 24h: {min_24h:,.0f}$/{max_24h:,.0f}$ | P&L latent: {pnl_latent_str}"
+    )
+
     prompt_analyse = f"""Tu es un analyste de trading crypto expérimenté et prudent.
 Analyse les informations suivantes et donne une recommandation de trading BTC.
 
-PRIX ACTUEL DU BITCOIN : {prix_btc:,.2f} USDT
+CONTEXTE DE MARCHÉ :
+{contexte_technique}
 
 NEWS QUALITÉ 2-3 ({nb_qualite} sélectionnées sur {len(news)}) :
 {resume_news}
@@ -479,11 +578,11 @@ Guide de scoring :
     except Exception as e:
         log(f"⚠️  Erreur avec {modele_decision} : {e}")
         return {
-            "score": 0,
-            "recommandation": "ATTENDRE",
-            "explication": "Analyse impossible suite à une erreur technique. Par prudence : ATTENDRE.",
-            "modele_utilise": modele_decision,
-            "nb_qualite":     nb_qualite,
+            "score":           0,
+            "recommandation":  "ATTENDRE",
+            "explication":     "Analyse impossible suite à une erreur technique. Par prudence : ATTENDRE.",
+            "modele_utilise":  modele_decision,
+            "nb_qualite":      nb_qualite,
         }
 
     log(f"💬 Explication : {resultat.get('explication', '')}")
@@ -494,64 +593,138 @@ Guide de scoring :
 #  ÉTAPE 6 : SIMULATION DE TRADING (paper trading — argent fictif)
 # ─────────────────────────────────────────────────────────────
 
-def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float) -> tuple:
+def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float,
+                        score_sentiment: int = 0) -> tuple:
     """
     Simule un achat ou une vente de BTC selon la recommandation de Claude.
-    Applique les frais Binance (0.1%), le stop-loss (-5%) et le take-profit (+8%).
+    Applique : frais 0.1%, stop-loss -5%, take-profit +8%,
+               cooldown 4h post-trade, limite 4 trades/jour.
     ⚠️  AUCUN ordre réel n'est envoyé à Binance — 100% fictif.
-
-    Retourne : (description_action, portefeuille_mis_à_jour)
     """
-    action = "AUCUNE ACTION"
-    raison_vente = ""  # Préfixe "STOP-LOSS" ou "TAKE-PROFIT" si déclenché automatiquement
+    action       = "AUCUNE ACTION"
+    raison_vente = ""
+    maintenant_ts = time.time()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # ── Vérification Stop-Loss / Take-Profit (prioritaire sur la recommandation IA) ──
+    # ── Réinitialiser compteur quotidien si nouveau jour ──
+    if portefeuille.get("date_trades", "") != today:
+        portefeuille["trades_aujourd_hui"] = 0
+        portefeuille["date_trades"]        = today
+
+    # ── Vérification Stop-Loss / Take-Profit (prioritaire) ──
     if portefeuille["en_position"] and portefeuille["prix_achat_btc"] > 0:
         variation = prix_btc / portefeuille["prix_achat_btc"] - 1
         if variation <= -STOP_LOSS_PCT:
             log(f"🛑 STOP-LOSS déclenché ({variation*100:+.1f}%) → vente forcée")
             recommandation = "VENDRE"
-            raison_vente = "[STOP-LOSS] "
+            raison_vente   = "stop-loss"
         elif variation >= TAKE_PROFIT_PCT:
             log(f"🎯 TAKE-PROFIT déclenché ({variation*100:+.1f}%) → vente forcée")
             recommandation = "VENDRE"
-            raison_vente = "[TAKE-PROFIT] "
+            raison_vente   = "take-profit"
+
+    # ── Vérification cooldown post-trade (4h entre trades opposés) ──
+    if recommandation in ("ACHETER", "VENDRE"):
+        dernier_ts   = portefeuille.get("dernier_trade_timestamp", 0.0)
+        dernier_type = portefeuille.get("dernier_trade_type", "")
+        temps_ecoule = maintenant_ts - dernier_ts
+        # Cooldown actif seulement si c'est un trade opposé au dernier
+        if (dernier_type != "" and dernier_type != recommandation
+                and temps_ecoule < COOLDOWN_POST_TRADE_S
+                and not raison_vente):  # SL/TP ignorent le cooldown
+            restant = int((COOLDOWN_POST_TRADE_S - temps_ecoule) / 60)
+            log(f"⏳ COOLDOWN actif ({dernier_type} → {recommandation}) "
+                f"— encore ~{restant} min à attendre")
+            recommandation = "ATTENDRE"
+
+    # ── Vérification limite quotidienne de trades ──
+    if recommandation in ("ACHETER", "VENDRE") and not raison_vente:
+        nb_trades = portefeuille.get("trades_aujourd_hui", 0)
+        if nb_trades >= MAX_TRADES_PAR_JOUR:
+            log(f"🚫 Limite de {MAX_TRADES_PAR_JOUR} trades/jour atteinte "
+                f"({nb_trades} trades) → ATTENDRE")
+            recommandation = "ATTENDRE"
 
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
-        # ── Simuler un achat avec frais ──
-        capital = portefeuille["usdt_disponible"]
-        frais = round(capital * FRAIS_TRADING, 4)
-        btc_achete = (capital - frais) / prix_btc  # Frais déduits avant achat
+        capital    = portefeuille["usdt_disponible"]
+        frais      = round(capital * FRAIS_TRADING, 4)
+        btc_achete = (capital - frais) / prix_btc
 
         portefeuille["btc_en_stock"]   = btc_achete
-        portefeuille["en_position"]     = True
-        portefeuille["prix_achat_btc"]  = prix_btc
+        portefeuille["en_position"]    = True
+        portefeuille["prix_achat_btc"] = prix_btc
         portefeuille["usdt_disponible"] = 0.0
+
+        # Cooldown & compteur
+        portefeuille["dernier_trade_timestamp"] = maintenant_ts
+        portefeuille["dernier_trade_type"]      = "ACHETER"
+        portefeuille["trades_aujourd_hui"]      = portefeuille.get("trades_aujourd_hui", 0) + 1
+        portefeuille["date_trades"]             = today
+
+        # Historique
+        historique = charger_historique_trades()
+        historique.append({
+            "timestamp_ouverture": datetime.now(timezone.utc).isoformat(),
+            "timestamp_fermeture": None,
+            "prix_entree":         prix_btc,
+            "prix_sortie":         None,
+            "pnl_usdt":            None,
+            "pnl_pct":             None,
+            "duree_minutes":       None,
+            "score_sentiment":     score_sentiment,
+            "raison_sortie":       None,
+            "status":              "open",
+        })
+        sauvegarder_historique_trades(historique)
 
         action = (f"📈 ACHAT FICTIF : {btc_achete:.6f} BTC "
                   f"à {prix_btc:,.2f} USDT (investi: {capital:.2f} USDT, frais: {frais:.2f} USDT)")
         log(action)
 
     elif recommandation == "VENDRE" and portefeuille["en_position"]:
-        # ── Simuler une vente avec frais ──
-        valeur_brute  = portefeuille["btc_en_stock"] * prix_btc
-        frais         = round(valeur_brute * FRAIS_TRADING, 4)
-        valeur_vente  = valeur_brute - frais  # Frais déduits sur la vente
-        cout_achat    = portefeuille["btc_en_stock"] * portefeuille["prix_achat_btc"]
-        pnl_trade     = valeur_vente - cout_achat
+        valeur_brute = portefeuille["btc_en_stock"] * prix_btc
+        frais        = round(valeur_brute * FRAIS_TRADING, 4)
+        valeur_vente = valeur_brute - frais
+        cout_achat   = portefeuille["btc_en_stock"] * portefeuille["prix_achat_btc"]
+        pnl_trade    = valeur_vente - cout_achat
+        pnl_pct      = (valeur_vente / cout_achat - 1) * 100 if cout_achat > 0 else 0.0
 
         portefeuille["usdt_disponible"] = valeur_vente
         portefeuille["btc_en_stock"]    = 0.0
-        portefeuille["en_position"]      = False
-        portefeuille["prix_achat_btc"]   = 0.0
+        portefeuille["en_position"]     = False
+        portefeuille["prix_achat_btc"]  = 0.0
 
+        # Cooldown & compteur
+        portefeuille["dernier_trade_timestamp"] = maintenant_ts
+        portefeuille["dernier_trade_type"]      = "VENDRE"
+        portefeuille["trades_aujourd_hui"]      = portefeuille.get("trades_aujourd_hui", 0) + 1
+        portefeuille["date_trades"]             = today
+
+        # Historique : fermer le trade ouvert
+        historique = charger_historique_trades()
+        ts_fermeture = datetime.now(timezone.utc)
+        for trade in reversed(historique):
+            if trade.get("status") == "open":
+                ts_ouv = datetime.fromisoformat(trade["timestamp_ouverture"])
+                duree  = (ts_fermeture - ts_ouv).total_seconds() / 60
+                trade["timestamp_fermeture"] = ts_fermeture.isoformat()
+                trade["prix_sortie"]         = prix_btc
+                trade["pnl_usdt"]            = round(pnl_trade, 4)
+                trade["pnl_pct"]             = round(pnl_pct, 2)
+                trade["duree_minutes"]       = round(duree, 1)
+                trade["raison_sortie"]       = raison_vente if raison_vente else "signal"
+                trade["status"]              = "closed"
+                break
+        sauvegarder_historique_trades(historique)
+
+        prefixe = f"[{raison_vente.upper()}] " if raison_vente else ""
         signe = "+" if pnl_trade >= 0 else ""
-        action = (f"{raison_vente}📉 VENTE FICTIVE : {valeur_vente:.2f} USDT récupérés "
-                  f"(frais: {frais:.2f} USDT | P&L trade: {signe}{pnl_trade:.2f} USDT)")
+        action = (f"{prefixe}📉 VENTE FICTIVE : {valeur_vente:.2f} USDT récupérés "
+                  f"(frais: {frais:.2f} USDT | P&L trade: {signe}{pnl_trade:.2f} USDT "
+                  f"/ {signe}{pnl_pct:.1f}%)")
         log(action)
 
     else:
-        # Aucune action : soit ATTENDRE, soit impossible (ex: ACHETER mais déjà en position)
         valeur_actuelle = calculer_valeur_portfolio(portefeuille, prix_btc)
         if portefeuille["en_position"]:
             variation = (prix_btc / portefeuille["prix_achat_btc"] - 1) * 100
@@ -565,10 +738,7 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
 
 
 def calculer_valeur_portfolio(portefeuille: dict, prix_btc: float) -> float:
-    """
-    Calcule la valeur totale du portfolio fictif en USDT au prix actuel.
-    USDT disponible + valeur des BTC détenus converti en USDT.
-    """
+    """Calcule la valeur totale du portfolio fictif en USDT au prix actuel."""
     valeur = portefeuille["usdt_disponible"]
     if portefeuille["en_position"] and portefeuille["btc_en_stock"] > 0:
         valeur += portefeuille["btc_en_stock"] * prix_btc
@@ -576,11 +746,14 @@ def calculer_valeur_portfolio(portefeuille: dict, prix_btc: float) -> float:
 
 
 def _calculer_valeur_bh(portefeuille: dict, prix_btc: float) -> float:
-    """Valeur du portfolio Buy & Hold de référence : achat fictif au 1er prix enregistré."""
+    """
+    Valeur du portfolio Buy & Hold de référence.
+    Soustrait les frais d'achat initial pour être comparable à l'agent.
+    """
     prix_initial = portefeuille.get("prix_initial_bh", 0.0)
     if prix_initial <= 0 or prix_btc <= 0:
         return CAPITAL_DEPART_USDT
-    return CAPITAL_DEPART_USDT / prix_initial * prix_btc
+    return (CAPITAL_DEPART_USDT * (1 - FRAIS_TRADING)) / prix_initial * prix_btc
 
 
 # ─────────────────────────────────────────────────────────────
@@ -606,10 +779,7 @@ EN_TETES_EXCEL = [
 
 
 def initialiser_excel():
-    """
-    Crée le fichier Excel avec les en-têtes si il n'existe pas encore.
-    Si le fichier existe déjà, ajoute les colonnes B&H manquantes si nécessaire.
-    """
+    """Crée le fichier Excel avec les en-têtes si il n'existe pas encore."""
     bold = openpyxl.styles.Font(bold=True)
 
     if not os.path.exists(FICHIER_EXCEL):
@@ -623,7 +793,6 @@ def initialiser_excel():
         log(f"📁 Fichier Excel créé : {FICHIER_EXCEL}")
         return
 
-    # Migration : ajouter les colonnes B&H si absentes
     classeur = openpyxl.load_workbook(FICHIER_EXCEL)
     feuille  = classeur.active
     en_tetes_actuels = [c.value for c in feuille[1]]
@@ -646,10 +815,7 @@ def initialiser_excel():
 
 def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
                             action: str, valeur_portfolio: float, valeur_bh: float):
-    """
-    Ajoute une nouvelle ligne dans le fichier Excel avec toutes les données du cycle,
-    y compris la comparaison avec la stratégie Buy & Hold.
-    """
+    """Ajoute une nouvelle ligne dans le fichier Excel avec toutes les données du cycle."""
     pnl_total = valeur_portfolio - CAPITAL_DEPART_USDT
     pnl_bh    = valeur_bh - CAPITAL_DEPART_USDT
 
@@ -693,14 +859,13 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
 def executer_un_cycle(portefeuille: dict) -> dict:
     """
     Exécute UN cycle complet de l'agent :
-    1. Vérifier les nouvelles news
-    2. Si nouvelles news → récupérer le prix BTC
-    3. Analyser avec Claude (Haiku ou Sonnet selon le signal)
-    4. Simuler une transaction (paper trading)
-    5. Enregistrer dans Excel
-    6. Retourner le portefeuille mis à jour
-
-    Si aucune nouvelle news, retourne le portefeuille inchangé.
+    1. Vérifier les nouvelles news (filtre âge 6h)
+    2. Si 0 news récentes → ATTENDRE sans appeler Claude
+    3. Récupérer le prix BTC
+    4. Analyser avec Claude (Haiku ou Sonnet selon le signal)
+    5. Simuler une transaction (paper trading)
+    6. Enregistrer dans Excel
+    7. Retourner le portefeuille mis à jour
     """
     separateur = "─" * 55
     log(separateur)
@@ -735,12 +900,15 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         portefeuille["prix_initial_bh"] = prix_btc
         log(f"📊 Prix de référence Buy & Hold initialisé : {prix_btc:,.2f} USDT")
 
-    # ── Étapes 3 & 4 : Analyser avec Claude ──
-    analyse = analyser_avec_claude(prix_btc, nouvelles_news)
+    # ── Étapes 3 & 4 : Analyser avec Claude (avec contexte portefeuille) ──
+    analyse = analyser_avec_claude(prix_btc, nouvelles_news, portefeuille=portefeuille)
 
     # ── Étape 6 : Simuler une transaction ──
     recommandation = analyse.get("recommandation", "ATTENDRE")
-    action, portefeuille = simuler_transaction(portefeuille, recommandation, prix_btc)
+    action, portefeuille = simuler_transaction(
+        portefeuille, recommandation, prix_btc,
+        score_sentiment=analyse.get("score", 0)
+    )
 
     # ── Sauvegarder le portefeuille ──
     sauvegarder_portfolio(portefeuille)
@@ -750,7 +918,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     valeur_bh = _calculer_valeur_bh(portefeuille, prix_btc)
     enregistrer_dans_excel(prix_btc, nouvelles_news, analyse, action, valeur_portfolio, valeur_bh)
 
-    pnl = valeur_portfolio - CAPITAL_DEPART_USDT
+    pnl    = valeur_portfolio - CAPITAL_DEPART_USDT
     pnl_bh = valeur_bh - CAPITAL_DEPART_USDT
     signe    = "+" if pnl >= 0 else ""
     signe_bh = "+" if pnl_bh >= 0 else ""
@@ -770,12 +938,8 @@ def main():
 
     Deux modes de fonctionnement :
     - Mode local (Mac)           : boucle infinie, attend 15 min entre chaque cycle
-                                   → lance avec : python3 trading_agent.py
     - Mode GitHub Actions (--once) : exécute UN seul cycle puis s'arrête
-                                   → GitHub Actions relance le script toutes les 15 min
-                                   → lance avec : python3 trading_agent.py --once
     """
-    # Détecter si on est en mode "un seul cycle" (GitHub Actions)
     mode_unique = "--once" in sys.argv
 
     log("=" * 55)
@@ -790,6 +954,9 @@ def main():
     log(f"   Frais trading            : {FRAIS_TRADING*100:.1f}% par trade")
     log(f"   Stop-loss                : -{STOP_LOSS_PCT*100:.0f}%")
     log(f"   Take-profit              : +{TAKE_PROFIT_PCT*100:.0f}%")
+    log(f"   Cooldown post-trade      : {COOLDOWN_POST_TRADE_S // 3600}h")
+    log(f"   Max trades/jour          : {MAX_TRADES_PAR_JOUR}")
+    log(f"   Filtre âge news          : {FILTRE_AGE_MAX_SECONDES // 3600}h max")
     log(f"   Limite coût API/jour     : ${LIMITE_COUT_QUOTIDIEN_USD:.2f}")
     usage_actuel = charger_usage_quotidien()
     log(f"   Dépense API aujourd'hui  : ${usage_actuel['cout_total_usd']:.4f} "
@@ -797,7 +964,6 @@ def main():
     log("=" * 55)
     log("")
 
-    # ── Vérification que la clé API Anthropic est bien renseignée ──
     if not ANTHROPIC_API_KEY:
         log("❌ ERREUR : Clé API manquante : ANTHROPIC_API_KEY")
         log("   En local : remplis le fichier .env")
@@ -807,7 +973,6 @@ def main():
     if not BINANCE_API_KEY:
         log("ℹ️  Pas de clé Binance — le prix BTC sera quand même récupéré (lecture publique).")
 
-    # ── Initialiser le fichier Excel et charger le portefeuille ──
     initialiser_excel()
     portefeuille = charger_portfolio()
 
@@ -815,6 +980,10 @@ def main():
         log(f"📂 Portfolio chargé — En position BTC ({portefeuille['btc_en_stock']:.6f} BTC)")
     else:
         log(f"📂 Portfolio chargé — USDT disponible : {portefeuille['usdt_disponible']:.2f}")
+
+    nb_trades = portefeuille.get("trades_aujourd_hui", 0)
+    if nb_trades > 0:
+        log(f"📊 Trades aujourd'hui : {nb_trades}/{MAX_TRADES_PAR_JOUR}")
 
     # ════════════════════════════════════════════
     #  MODE GITHUB ACTIONS : un seul cycle puis exit
@@ -865,7 +1034,5 @@ def main():
             break
 
 
-# Ce bloc s'exécute uniquement si on lance ce fichier directement
-# (pas si on l'importe depuis un autre script)
 if __name__ == "__main__":
     main()
