@@ -70,8 +70,8 @@ MODELE_SONNET = "claude-sonnet-4-6"
 SEUIL_NEWS_PERTINENTES = 2
 
 FRAIS_TRADING         = 0.001
-STOP_LOSS_PCT         = 0.07
-TAKE_PROFIT_PCT       = 0.12
+STOP_LOSS_PCT         = 0.07   # protection absolue crash brutal (-7% depuis l'achat)
+TRAILING_STOP_PCT     = 0.04   # recul maximal depuis le prix max atteint (-4%)
 MIN_PNL_ATTENDU_USDT  = 1.50   # P&L net minimum pour ouvrir/fermer une position (5× frais 0,30 USDT)
 
 LIMITE_COUT_QUOTIDIEN_USD = 1.00
@@ -108,23 +108,25 @@ def charger_portfolio() -> dict:
     if os.path.exists(FICHIER_PORTFOLIO):
         with open(FICHIER_PORTFOLIO, "r") as f:
             data = json.load(f)
-        data.setdefault("prix_initial_bh",       0.0)
-        data.setdefault("dernier_trade_timestamp", 0.0)
-        data.setdefault("dernier_trade_type",      "")
-        data.setdefault("trades_aujourd_hui",      0)
-        data.setdefault("date_trades",             "")
+        data.setdefault("prix_initial_bh",          0.0)
+        data.setdefault("dernier_trade_timestamp",  0.0)
+        data.setdefault("dernier_trade_type",       "")
+        data.setdefault("trades_aujourd_hui",       0)
+        data.setdefault("date_trades",              "")
+        data.setdefault("prix_max_depuis_achat",    0.0)
         return data
 
     return {
-        "usdt_disponible":         CAPITAL_DEPART_USDT,
-        "btc_en_stock":            0.0,
-        "en_position":             False,
-        "prix_achat_btc":          0.0,
-        "prix_initial_bh":         0.0,
-        "dernier_trade_timestamp": 0.0,
-        "dernier_trade_type":      "",
-        "trades_aujourd_hui":      0,
-        "date_trades":             "",
+        "usdt_disponible":          CAPITAL_DEPART_USDT,
+        "btc_en_stock":             0.0,
+        "en_position":              False,
+        "prix_achat_btc":           0.0,
+        "prix_initial_bh":          0.0,
+        "dernier_trade_timestamp":  0.0,
+        "dernier_trade_type":       "",
+        "trades_aujourd_hui":       0,
+        "date_trades":              "",
+        "prix_max_depuis_achat":    0.0,
     }
 
 
@@ -656,7 +658,7 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
                         score_sentiment: int = 0) -> tuple:
     """
     Simule un achat ou une vente de BTC selon la recommandation de Claude.
-    Applique : frais 0.1%, stop-loss -7%, take-profit +12%,
+    Applique : frais 0.1%, stop-loss -7% (absolu), trailing stop -4% depuis le max,
                cooldown 4h post-trade, limite 4 trades/jour,
                P&L attendu minimum 1,50 USDT.
     ⚠️  AUCUN ordre réel n'est envoyé à Binance — 100% fictif.
@@ -671,17 +673,29 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
         portefeuille["trades_aujourd_hui"] = 0
         portefeuille["date_trades"]        = today
 
-    # ── Vérification Stop-Loss / Take-Profit (prioritaire) ──
+    # ── Mise à jour du prix max + Stop-Loss absolu + Trailing Stop (prioritaire) ──
     if portefeuille["en_position"] and portefeuille["prix_achat_btc"] > 0:
-        variation = prix_btc / portefeuille["prix_achat_btc"] - 1
-        if variation <= -STOP_LOSS_PCT:
-            log(f"🛑 STOP-LOSS déclenché ({variation*100:+.1f}%) → vente forcée")
+        # Mettre à jour le plus haut atteint depuis l'achat
+        prix_max = max(portefeuille.get("prix_max_depuis_achat", prix_btc), prix_btc)
+        portefeuille["prix_max_depuis_achat"] = prix_max
+
+        variation_achat = prix_btc / portefeuille["prix_achat_btc"] - 1
+
+        if variation_achat <= -STOP_LOSS_PCT:
+            log(f"🛑 STOP-LOSS déclenché ({variation_achat*100:+.1f}% depuis achat) → vente forcée")
             recommandation = "VENDRE"
             raison_vente   = "stop-loss"
-        elif variation >= TAKE_PROFIT_PCT:
-            log(f"🎯 TAKE-PROFIT déclenché ({variation*100:+.1f}%) → vente forcée")
-            recommandation = "VENDRE"
-            raison_vente   = "take-profit"
+        else:
+            seuil_trailing = prix_max * (1 - TRAILING_STOP_PCT)
+            if prix_btc <= seuil_trailing:
+                ecart_max = (prix_btc / prix_max - 1) * 100
+                log(f"📉 TRAILING STOP déclenché ({ecart_max:+.1f}% depuis max {prix_max:,.0f} USDT, "
+                    f"seuil: {seuil_trailing:,.0f} USDT) → vente forcée")
+                recommandation = "VENDRE"
+                raison_vente   = "trailing-stop"
+            else:
+                log(f"📊 Trailing stop actif : seuil {seuil_trailing:,.0f} USDT "
+                    f"(max: {prix_max:,.0f} USDT | actuel: {prix_btc:,.0f} USDT)")
 
     # ── Vérification cooldown post-trade (4h entre trades opposés) ──
     if recommandation in ("ACHETER", "VENDRE"):
@@ -708,9 +722,9 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
     # ── Vérification P&L attendu minimum (1,50 USDT = 5× frais) ──
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
         capital_dispo = portefeuille["usdt_disponible"]
-        pnl_attendu_achat = capital_dispo * TAKE_PROFIT_PCT - 2 * capital_dispo * FRAIS_TRADING
+        pnl_attendu_achat = capital_dispo * TRAILING_STOP_PCT - 2 * capital_dispo * FRAIS_TRADING
         if pnl_attendu_achat < MIN_PNL_ATTENDU_USDT:
-            log(f"💡 P&L attendu au TP ({pnl_attendu_achat:.2f} USDT) < {MIN_PNL_ATTENDU_USDT} USDT → ATTENDRE")
+            log(f"💡 P&L attendu (ref. trailing stop: {pnl_attendu_achat:.2f} USDT) < {MIN_PNL_ATTENDU_USDT} USDT → ATTENDRE")
             recommandation = "ATTENDRE"
 
     if recommandation == "VENDRE" and portefeuille["en_position"] and not raison_vente:
@@ -727,10 +741,11 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
         frais      = round(capital * FRAIS_TRADING, 4)
         btc_achete = (capital - frais) / prix_btc
 
-        portefeuille["btc_en_stock"]   = btc_achete
-        portefeuille["en_position"]    = True
-        portefeuille["prix_achat_btc"] = prix_btc
-        portefeuille["usdt_disponible"] = 0.0
+        portefeuille["btc_en_stock"]          = btc_achete
+        portefeuille["en_position"]           = True
+        portefeuille["prix_achat_btc"]        = prix_btc
+        portefeuille["usdt_disponible"]       = 0.0
+        portefeuille["prix_max_depuis_achat"] = prix_btc  # initialise le trailing stop
 
         # Cooldown & compteur
         portefeuille["dernier_trade_timestamp"] = maintenant_ts
@@ -766,10 +781,11 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
         pnl_trade    = valeur_vente - cout_achat
         pnl_pct      = (valeur_vente / cout_achat - 1) * 100 if cout_achat > 0 else 0.0
 
-        portefeuille["usdt_disponible"] = valeur_vente
-        portefeuille["btc_en_stock"]    = 0.0
-        portefeuille["en_position"]     = False
-        portefeuille["prix_achat_btc"]  = 0.0
+        portefeuille["usdt_disponible"]       = valeur_vente
+        portefeuille["btc_en_stock"]          = 0.0
+        portefeuille["en_position"]           = False
+        portefeuille["prix_achat_btc"]        = 0.0
+        portefeuille["prix_max_depuis_achat"] = 0.0  # réinitialise le trailing stop
 
         # Cooldown & compteur
         portefeuille["dernier_trade_timestamp"] = maintenant_ts
@@ -804,9 +820,12 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
     else:
         valeur_actuelle = calculer_valeur_portfolio(portefeuille, prix_btc)
         if portefeuille["en_position"]:
-            variation = (prix_btc / portefeuille["prix_achat_btc"] - 1) * 100
+            variation  = (prix_btc / portefeuille["prix_achat_btc"] - 1) * 100
+            prix_max   = portefeuille.get("prix_max_depuis_achat", prix_btc)
+            seuil_ts   = prix_max * (1 - TRAILING_STOP_PCT)
             action = (f"⏳ EN POSITION — Valeur: {valeur_actuelle:.2f} USDT "
-                      f"({variation:+.1f}% depuis achat à {portefeuille['prix_achat_btc']:,.0f} USDT)")
+                      f"({variation:+.1f}% depuis achat à {portefeuille['prix_achat_btc']:,.0f} USDT) "
+                      f"| Trailing stop: {seuil_ts:,.0f} USDT")
         else:
             action = f"⏳ EN ATTENTE — Capital disponible : {valeur_actuelle:.2f} USDT"
         log(action)
@@ -854,6 +873,7 @@ EN_TETES_EXCEL = [
     "News qualité 2-3",
     "Raisonnement Claude",
     "Fear & Greed",
+    "Trailing Stop (USDT)",
 ]
 
 
@@ -891,7 +911,7 @@ def initialiser_excel():
         classeur.save(FICHIER_EXCEL)
         en_tetes_actuels = [c.value for c in feuille[1]]
         log("📁 Colonne 'News qualité 2-3' ajoutée au fichier Excel existant.")
-    for col_name in ("Raisonnement Claude", "Fear & Greed"):
+    for col_name in ("Raisonnement Claude", "Fear & Greed", "Trailing Stop (USDT)"):
         if col_name not in en_tetes_actuels:
             col = len(en_tetes_actuels) + 1
             cell = feuille.cell(row=1, column=col, value=col_name)
@@ -902,7 +922,8 @@ def initialiser_excel():
 
 
 def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
-                            action: str, valeur_portfolio: float, valeur_bh: float):
+                            action: str, valeur_portfolio: float, valeur_bh: float,
+                            trailing_stop: float = None):
     """Ajoute une nouvelle ligne dans le fichier Excel avec toutes les données du cycle."""
     pnl_total = valeur_portfolio - CAPITAL_DEPART_USDT
     pnl_bh    = valeur_bh - CAPITAL_DEPART_USDT
@@ -934,6 +955,7 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
         analyse.get("nb_qualite", 0),
         analyse.get("analyse_preliminaire", ""),
         fg_excel,
+        round(trailing_stop, 2) if trailing_stop is not None else "N/A",
     ]
 
     classeur = openpyxl.load_workbook(FICHIER_EXCEL)
@@ -976,13 +998,19 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     if not nouvelles_news:
         log("💤 Pas de nouvelles news ce cycle — écriture heartbeat dans Excel.")
         valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
-        valeur_bh = _calculer_valeur_bh(portefeuille, prix_btc)
+        valeur_bh        = _calculer_valeur_bh(portefeuille, prix_btc)
+        ts_heartbeat     = None
+        if portefeuille["en_position"]:
+            pm = portefeuille.get("prix_max_depuis_achat", 0.0)
+            if pm > 0:
+                ts_heartbeat = round(pm * (1 - TRAILING_STOP_PCT), 2)
         enregistrer_dans_excel(
             prix_btc, [],
             {"score": 0, "recommandation": "ATTENDRE", "modele_utilise": "—", "nb_qualite": 0},
             "ATTENDRE",
             valeur_portfolio,
             valeur_bh,
+            trailing_stop=ts_heartbeat,
         )
         return portefeuille
 
@@ -1020,8 +1048,14 @@ def executer_un_cycle(portefeuille: dict) -> dict:
 
     # ── Étape 5 : Enregistrer dans Excel ──
     valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
-    valeur_bh = _calculer_valeur_bh(portefeuille, prix_btc)
-    enregistrer_dans_excel(prix_btc, nouvelles_news, analyse, action, valeur_portfolio, valeur_bh)
+    valeur_bh        = _calculer_valeur_bh(portefeuille, prix_btc)
+    ts_niveau = None
+    if portefeuille["en_position"]:
+        pm = portefeuille.get("prix_max_depuis_achat", 0.0)
+        if pm > 0:
+            ts_niveau = round(pm * (1 - TRAILING_STOP_PCT), 2)
+    enregistrer_dans_excel(prix_btc, nouvelles_news, analyse, action, valeur_portfolio, valeur_bh,
+                           trailing_stop=ts_niveau)
 
     pnl    = valeur_portfolio - CAPITAL_DEPART_USDT
     pnl_bh = valeur_bh - CAPITAL_DEPART_USDT
@@ -1057,8 +1091,8 @@ def main():
     log(f"   Fichier Excel            : {FICHIER_EXCEL}")
     log(f"   Seuil news qualité 2-3   : ≥{SEUIL_NEWS_PERTINENTES} → Sonnet décide")
     log(f"   Frais trading            : {FRAIS_TRADING*100:.1f}% par trade")
-    log(f"   Stop-loss                : -{STOP_LOSS_PCT*100:.0f}%")
-    log(f"   Take-profit              : +{TAKE_PROFIT_PCT*100:.0f}%")
+    log(f"   Stop-loss (absolu)       : -{STOP_LOSS_PCT*100:.0f}%")
+    log(f"   Trailing stop            : -{TRAILING_STOP_PCT*100:.0f}% depuis le prix max")
     log(f"   Cooldown post-trade      : {COOLDOWN_POST_TRADE_S // 3600}h")
     log(f"   Max trades/jour          : {MAX_TRADES_PAR_JOUR}")
     log(f"   Filtre âge news          : {FILTRE_AGE_MAX_SECONDES // 3600}h max")
