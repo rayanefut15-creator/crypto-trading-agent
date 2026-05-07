@@ -194,11 +194,14 @@ def _contient_spam(texte: str) -> bool:
 
 
 def _age_article_secondes(pub_date_str: str) -> float:
-    """Retourne l'âge en secondes d'un article depuis sa pubDate RSS."""
+    """Retourne l'âge en secondes d'un article depuis sa pubDate RSS.
+    Dates antérieures à 2020 → considérées comme trop anciennes (float('inf'))."""
     if not pub_date_str:
         return 0.0
     try:
         dt = parsedate_to_datetime(pub_date_str)
+        if dt.year < 2020:
+            return float("inf")
         return (datetime.now(timezone.utc) - dt).total_seconds()
     except Exception:
         return 0.0
@@ -215,7 +218,8 @@ def recuperer_nouvelles_news() -> list:
     tous_articles = []
     for feed_url in RSS_FEEDS:
         try:
-            feed = feedparser.parse(feed_url)
+            reponse_rss = get_with_retry(feed_url, timeout=15)
+            feed = feedparser.parse(reponse_rss.content)
             for entry in feed.entries:
                 titre = entry.get("title", "").strip()
                 lien  = entry.get("link", "").strip()
@@ -278,45 +282,33 @@ def recuperer_nouvelles_news() -> list:
 
 
 # ─────────────────────────────────────────────────────────────
+#  UTILITAIRE HTTP : RETRY AVEC BACKOFF EXPONENTIEL
+# ─────────────────────────────────────────────────────────────
+
+def get_with_retry(url: str, max_tries: int = 3, **kwargs) -> requests.Response:
+    """GET avec backoff exponentiel : 2 s, 4 s, 8 s entre tentatives."""
+    for attempt in range(max_tries):
+        try:
+            reponse = requests.get(url, **kwargs)
+            reponse.raise_for_status()
+            return reponse
+        except Exception as e:
+            if attempt == max_tries - 1:
+                raise
+            delai = 2 ** (attempt + 1)
+            log(f"⏳ HTTP retry {attempt + 1}/{max_tries} ({e}) — attente {delai}s")
+            time.sleep(delai)
+
+
+# ─────────────────────────────────────────────────────────────
 #  ÉTAPE 2 : RÉCUPÉRATION DU PRIX BTC + DONNÉES MARCHÉ
 # ─────────────────────────────────────────────────────────────
 
-def recuperer_prix_btc() -> float:
+def recuperer_donnees_completes_btc() -> dict:
     """
-    Récupère le prix actuel du Bitcoin.
-    Source primaire  : CoinGecko
-    Source de backup : Binance ticker public
-    """
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-        reponse = requests.get(url, timeout=10)
-        reponse.raise_for_status()
-        prix = float(reponse.json()["bitcoin"]["usd"])
-        log(f"💰 Prix actuel du BTC : {prix:,.2f} USD (CoinGecko)")
-        return prix
-    except Exception as e:
-        log(f"⚠️  CoinGecko indisponible ({e}) — tentative Binance...")
-
-    try:
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        reponse = requests.get(url, timeout=10)
-        reponse.raise_for_status()
-        prix = float(reponse.json()["price"])
-        log(f"💰 Prix actuel du BTC : {prix:,.2f} USD (Binance backup)")
-        return prix
-    except Exception as e:
-        log(f"⚠️  Binance indisponible ({e}) — prix BTC introuvable.")
-        return 0.0
-
-
-def recuperer_donnees_marche_btc() -> dict:
-    """
-    Récupère les données de marché BTC depuis CoinGecko :
-    - Variation 1h, 24h, 7j (en %)
-    - Prix min et max des dernières 24h
-
+    Récupère prix + données de marché BTC en un seul appel CoinGecko (coins/markets).
+    Backup Binance 24hr si CoinGecko indisponible (var_1h et var_7j non disponibles côté Binance).
     Retourne un dict avec les clés : prix, var_1h, var_24h, var_7j, min_24h, max_24h.
-    Retourne un dict vide en cas d'erreur.
     """
     try:
         url = (
@@ -324,20 +316,40 @@ def recuperer_donnees_marche_btc() -> dict:
             "?vs_currency=usd&ids=bitcoin"
             "&price_change_percentage=1h,24h,7d"
         )
-        reponse = requests.get(url, timeout=10)
-        reponse.raise_for_status()
+        reponse = get_with_retry(url, timeout=10)
         data = reponse.json()[0]
+        prix    = float(data.get("current_price", 0.0))
+        var_1h  = data.get("price_change_percentage_1h_in_currency", 0.0) or 0.0
+        var_24h = data.get("price_change_percentage_24h_in_currency", 0.0) or 0.0
+        log(f"💰 BTC : {prix:,.2f} USD | 1h: {var_1h:+.2f}% | 24h: {var_24h:+.2f}% (CoinGecko)")
         return {
-            "prix":    data.get("current_price", 0.0),
-            "var_1h":  data.get("price_change_percentage_1h_in_currency", 0.0) or 0.0,
-            "var_24h": data.get("price_change_percentage_24h_in_currency", 0.0) or 0.0,
+            "prix":    prix,
+            "var_1h":  var_1h,
+            "var_24h": var_24h,
             "var_7j":  data.get("price_change_percentage_7d_in_currency", 0.0) or 0.0,
             "min_24h": data.get("low_24h", 0.0) or 0.0,
             "max_24h": data.get("high_24h", 0.0) or 0.0,
         }
     except Exception as e:
-        log(f"⚠️  Données marché CoinGecko indisponibles ({e})")
-        return {}
+        log(f"⚠️  CoinGecko indisponible ({e}) — tentative Binance...")
+
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
+        reponse = get_with_retry(url, timeout=10)
+        data = reponse.json()
+        prix = float(data.get("lastPrice", 0.0))
+        log(f"💰 BTC : {prix:,.2f} USD (Binance backup, var_1h/7j N/A)")
+        return {
+            "prix":    prix,
+            "var_1h":  0.0,
+            "var_24h": float(data.get("priceChangePercent", 0.0)),
+            "var_7j":  0.0,
+            "min_24h": float(data.get("lowPrice", 0.0)),
+            "max_24h": float(data.get("highPrice", 0.0)),
+        }
+    except Exception as e:
+        log(f"⚠️  Binance indisponible ({e}) — données BTC introuvables.")
+        return {"prix": 0.0, "var_1h": 0.0, "var_24h": 0.0, "var_7j": 0.0, "min_24h": 0.0, "max_24h": 0.0}
 
 
 def recuperer_fear_greed() -> dict:
@@ -346,8 +358,7 @@ def recuperer_fear_greed() -> dict:
     Retourne {"valeur": int, "classification": str} ou {} en cas d'erreur.
     """
     try:
-        reponse = requests.get("https://api.alternative.me/fng/", timeout=10)
-        reponse.raise_for_status()
+        reponse = get_with_retry("https://api.alternative.me/fng/", timeout=10)
         data = reponse.json()["data"][0]
         valeur = int(data["value"])
         classification = data["value_classification"]
@@ -471,7 +482,7 @@ L'ordre doit correspondre exactement à la liste. Chaque score est 0, 1, 2 ou 3.
 #  ÉTAPE 4 : DÉCISION FINALE (Haiku ou Sonnet selon le filtre)
 # ─────────────────────────────────────────────────────────────
 
-def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None) -> dict:
+def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None, marche: dict = None) -> dict:
     """
     Pipeline d'analyse en deux étapes :
     1. Haiku pré-filtre chaque news (score 0-3 : impact BTC)
@@ -527,7 +538,8 @@ def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None)
         resume_news += f"\n{i}. [{date_pub}] {titre} (Source: {source})"
 
     # ── Récupérer le contexte technique de marché ──
-    marche = recuperer_donnees_marche_btc()
+    if marche is None:
+        marche = recuperer_donnees_completes_btc()
     var_1h  = marche.get("var_1h",  0.0)
     var_24h = marche.get("var_24h", 0.0)
     var_7j  = marche.get("var_7j",  0.0)
@@ -957,9 +969,12 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     # ── Étape 1 : Vérifier les nouvelles news ──
     nouvelles_news = recuperer_nouvelles_news()
 
+    # ── Étape 2 : Récupérer prix + données marché (1 seul appel CoinGecko) ──
+    donnees_btc = recuperer_donnees_completes_btc()
+    prix_btc    = donnees_btc.get("prix", 0.0)
+
     if not nouvelles_news:
         log("💤 Pas de nouvelles news ce cycle — écriture heartbeat dans Excel.")
-        prix_btc = recuperer_prix_btc()
         valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
         valeur_bh = _calculer_valeur_bh(portefeuille, prix_btc)
         enregistrer_dans_excel(
@@ -971,8 +986,6 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         )
         return portefeuille
 
-    # ── Étape 2 : Récupérer le prix BTC ──
-    prix_btc = recuperer_prix_btc()
     if prix_btc == 0.0:
         log("⚠️  Prix BTC indisponible — cycle annulé par sécurité.")
         return portefeuille
@@ -982,8 +995,8 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         portefeuille["prix_initial_bh"] = prix_btc
         log(f"📊 Prix de référence Buy & Hold initialisé : {prix_btc:,.2f} USDT")
 
-    # ── Étapes 3 & 4 : Analyser avec Claude (avec contexte portefeuille) ──
-    analyse = analyser_avec_claude(prix_btc, nouvelles_news, portefeuille=portefeuille)
+    # ── Étapes 3 & 4 : Analyser avec Claude (données marché passées, 0 appel CoinGecko supplémentaire) ──
+    analyse = analyser_avec_claude(prix_btc, nouvelles_news, portefeuille=portefeuille, marche=donnees_btc)
 
     # ── Étape 6 : Simuler une transaction ──
     recommandation = analyse.get("recommandation", "ATTENDRE")

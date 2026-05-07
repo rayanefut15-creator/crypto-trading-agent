@@ -23,6 +23,12 @@ on:
   # Utile pour tester sans attendre 30 min
   workflow_dispatch:
 
+# Empêche deux cycles de tourner simultanément
+# cancel-in-progress: false = le cycle en cours finit toujours, le doublon est mis en file
+concurrency:
+  group: trading-agent
+  cancel-in-progress: false
+
 # Autorisation nécessaire pour que GitHub Actions puisse
 # sauvegarder les fichiers (Excel, portfolio, cache) dans le repo
 permissions:
