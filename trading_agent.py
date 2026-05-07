@@ -59,8 +59,9 @@ RSS_FEEDS = [
 
 MOTS_SPAM = {
     "casino", "presale", "pre-sale", "100x", "alphapepe", "pepeto",
-    "gambling", "airdrop", "giveaway", "prize", "sponsor",
-    "advertisement", "promoted",
+    "apemars", "gambling", "airdrop", "giveaway", "prize", "sponsor",
+    "advertisement", "promoted", "pepe", "shib", "doge", "meme coin",
+    "gem", "moonshot",
 }
 
 MODELE_HAIKU  = "claude-haiku-4-5-20251001"
@@ -68,9 +69,10 @@ MODELE_SONNET = "claude-sonnet-4-6"
 
 SEUIL_NEWS_PERTINENTES = 2
 
-FRAIS_TRADING    = 0.001
-STOP_LOSS_PCT    = 0.05
-TAKE_PROFIT_PCT  = 0.08
+FRAIS_TRADING         = 0.001
+STOP_LOSS_PCT         = 0.07
+TAKE_PROFIT_PCT       = 0.12
+MIN_PNL_ATTENDU_USDT  = 1.50   # P&L net minimum pour ouvrir/fermer une position (5× frais 0,30 USDT)
 
 LIMITE_COUT_QUOTIDIEN_USD = 1.00
 FICHIER_TOKEN_USAGE       = "token_usage.json"
@@ -642,8 +644,9 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
                         score_sentiment: int = 0) -> tuple:
     """
     Simule un achat ou une vente de BTC selon la recommandation de Claude.
-    Applique : frais 0.1%, stop-loss -5%, take-profit +8%,
-               cooldown 4h post-trade, limite 4 trades/jour.
+    Applique : frais 0.1%, stop-loss -7%, take-profit +12%,
+               cooldown 4h post-trade, limite 4 trades/jour,
+               P&L attendu minimum 1,50 USDT.
     ⚠️  AUCUN ordre réel n'est envoyé à Binance — 100% fictif.
     """
     action       = "AUCUNE ACTION"
@@ -688,6 +691,23 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
         if nb_trades >= MAX_TRADES_PAR_JOUR:
             log(f"🚫 Limite de {MAX_TRADES_PAR_JOUR} trades/jour atteinte "
                 f"({nb_trades} trades) → ATTENDRE")
+            recommandation = "ATTENDRE"
+
+    # ── Vérification P&L attendu minimum (1,50 USDT = 5× frais) ──
+    if recommandation == "ACHETER" and not portefeuille["en_position"]:
+        capital_dispo = portefeuille["usdt_disponible"]
+        pnl_attendu_achat = capital_dispo * TAKE_PROFIT_PCT - 2 * capital_dispo * FRAIS_TRADING
+        if pnl_attendu_achat < MIN_PNL_ATTENDU_USDT:
+            log(f"💡 P&L attendu au TP ({pnl_attendu_achat:.2f} USDT) < {MIN_PNL_ATTENDU_USDT} USDT → ATTENDRE")
+            recommandation = "ATTENDRE"
+
+    if recommandation == "VENDRE" and portefeuille["en_position"] and not raison_vente:
+        btc_held = portefeuille["btc_en_stock"]
+        val_brute_check = btc_held * prix_btc
+        frais_v_check   = val_brute_check * FRAIS_TRADING
+        pnl_si_vente    = val_brute_check - frais_v_check - btc_held * portefeuille["prix_achat_btc"]
+        if pnl_si_vente < MIN_PNL_ATTENDU_USDT:
+            log(f"💡 P&L si vente maintenant ({pnl_si_vente:.2f} USDT) < {MIN_PNL_ATTENDU_USDT} USDT → ATTENDRE")
             recommandation = "ATTENDRE"
 
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
@@ -967,6 +987,16 @@ def executer_un_cycle(portefeuille: dict) -> dict:
 
     # ── Étape 6 : Simuler une transaction ──
     recommandation = analyse.get("recommandation", "ATTENDRE")
+
+    # Hausser le seuil de vente : score ≤ -5 ET Sonnet requis (pas Haiku seul)
+    if recommandation == "VENDRE":
+        score_analyse  = analyse.get("score", 0)
+        modele_analyse = analyse.get("modele_utilise", "")
+        if score_analyse > -5 or modele_analyse != MODELE_SONNET:
+            log(f"⛔ Vente bloquée : score {score_analyse:+d} (requis ≤ -5) "
+                f"ou modèle non Sonnet ({modele_analyse}) → ATTENDRE")
+            recommandation = "ATTENDRE"
+
     action, portefeuille = simuler_transaction(
         portefeuille, recommandation, prix_btc,
         score_sentiment=analyse.get("score", 0)
