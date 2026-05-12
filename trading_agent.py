@@ -16,6 +16,7 @@ des décisions de trading BTC avec un capital fictif de 300 USDT.
 #  IMPORTATION DES BIBLIOTHÈQUES
 # ─────────────────────────────────────────────────────────────
 import os           # Lire les variables d'environnement
+import re           # Filtres regex anti-spam
 import sys          # Lire les arguments passés au script (ex: --once)
 import time         # Faire des pauses entre les cycles
 import json         # Sauvegarder des données dans des fichiers texte
@@ -189,10 +190,12 @@ def sauvegarder_cache_news(cache: dict):
 #  ÉTAPE 1 : RÉCUPÉRATION DES NEWS (RSS CoinDesk + Cointelegraph)
 # ─────────────────────────────────────────────────────────────
 
+_RE_SPAM = re.compile(r'\b\d{2,}x\b|\b\d{3,}%', re.IGNORECASE)
+
 def _contient_spam(texte: str) -> bool:
-    """Retourne True si le texte contient un mot de la liste MOTS_SPAM."""
+    """Retourne True si le texte contient un mot de MOTS_SPAM ou un pattern pump ("300x", "500%")."""
     texte_lower = texte.lower()
-    return any(mot in texte_lower for mot in MOTS_SPAM)
+    return any(mot in texte_lower for mot in MOTS_SPAM) or bool(_RE_SPAM.search(texte))
 
 
 def _age_article_secondes(pub_date_str: str) -> float:
