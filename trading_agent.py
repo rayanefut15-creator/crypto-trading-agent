@@ -996,7 +996,15 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     prix_btc    = donnees_btc.get("prix", 0.0)
 
     if not nouvelles_news:
-        log("💤 Pas de nouvelles news ce cycle — écriture heartbeat dans Excel.")
+        log("💤 Pas de nouvelles news ce cycle — vérification des stops si en position.")
+        action_heartbeat = "ATTENDRE"
+        if portefeuille["en_position"]:
+            # Vérifie trailing stop et stop-loss même sans news (crash nocturne)
+            action_heartbeat, portefeuille = simuler_transaction(
+                portefeuille, "ATTENDRE", prix_btc, score_sentiment=0
+            )
+            if action_heartbeat == "VENDRE":
+                sauvegarder_portfolio(portefeuille)
         valeur_portfolio = calculer_valeur_portfolio(portefeuille, prix_btc)
         valeur_bh        = _calculer_valeur_bh(portefeuille, prix_btc)
         ts_heartbeat     = None
@@ -1007,7 +1015,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         enregistrer_dans_excel(
             prix_btc, [],
             {"score": 0, "recommandation": "ATTENDRE", "modele_utilise": "—", "nb_qualite": 0},
-            "ATTENDRE",
+            action_heartbeat,
             valeur_portfolio,
             valeur_bh,
             trailing_stop=ts_heartbeat,
