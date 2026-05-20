@@ -357,6 +357,46 @@ def recuperer_donnees_completes_btc() -> dict:
         return {"prix": 0.0, "var_1h": 0.0, "var_24h": 0.0, "var_7j": 0.0, "min_24h": 0.0, "max_24h": 0.0}
 
 
+def recuperer_rsi(periode: int = 14) -> float:
+    """
+    Calcule le RSI sur `periode` périodes 1h via l'API publique Binance.
+    Appelle GET /api/v3/klines?symbol=BTCUSDT&interval=1h&limit=15.
+    Retourne la valeur float arrondie à 1 décimale, ou None en cas d'erreur.
+    """
+    try:
+        url = (
+            f"https://api.binance.com/api/v3/klines"
+            f"?symbol=BTCUSDT&interval=1h&limit={periode + 1}"
+        )
+        reponse = get_with_retry(url, timeout=10)
+        klines  = reponse.json()
+        closes  = [float(k[4]) for k in klines]   # indice 4 = prix de clôture
+
+        gains, pertes = [], []
+        for i in range(1, len(closes)):
+            delta = closes[i] - closes[i - 1]
+            if delta > 0:
+                gains.append(delta);  pertes.append(0.0)
+            else:
+                gains.append(0.0);    pertes.append(abs(delta))
+
+        avg_gain = sum(gains)  / periode
+        avg_loss = sum(pertes) / periode
+
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs  = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+
+        rsi = round(rsi, 1)
+        log(f"📈 RSI 14h : {rsi}")
+        return rsi
+    except Exception as e:
+        log(f"⚠️  RSI indisponible ({e})")
+        return None
+
+
 def recuperer_fear_greed() -> dict:
     """
     Récupère le Fear & Greed Index crypto via alternative.me (API gratuite).
@@ -487,7 +527,7 @@ L'ordre doit correspondre exactement à la liste. Chaque score est 0, 1, 2 ou 3.
 #  ÉTAPE 4 : DÉCISION FINALE (Haiku ou Sonnet selon le filtre)
 # ─────────────────────────────────────────────────────────────
 
-def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None, marche: dict = None) -> dict:
+def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None, marche: dict = None, rsi: float = None) -> dict:
     """
     Pipeline d'analyse en deux étapes :
     1. Haiku pré-filtre chaque news (score 0-3 : impact BTC)
@@ -564,11 +604,12 @@ def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None,
         signe = "+" if pnl_pct >= 0 else ""
         pnl_latent_str = f"{signe}{pnl_pct:.1f}%"
 
+    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
     contexte_technique = (
         f"Prix actuel: {prix_btc:,.0f}$ | Var 1h: {var_1h:+.2f}% | "
         f"Var 24h: {var_24h:+.2f}% | Var 7j: {var_7j:+.2f}%\n"
         f"Min/Max 24h: {min_24h:,.0f}$/{max_24h:,.0f}$ | P&L latent: {pnl_latent_str}\n"
-        f"Fear & Greed Index: {fg_str}"
+        f"Fear & Greed Index: {fg_str} | RSI 14h: {rsi_str}"
     )
 
     # ── Format de réponse JSON selon le modèle ──
@@ -626,6 +667,7 @@ Guide de scoring :
         resultat["nb_qualite"]          = nb_qualite
         resultat["fear_greed_valeur"]   = fg_valeur
         resultat["fear_greed_label"]    = fg_classification
+        resultat["rsi"]                 = rsi
         score = int(resultat.get("score", 0))
         nom_modele = "Sonnet" if modele_decision == MODELE_SONNET else "Haiku"
         log(f"📊 Score {nom_modele} : {score:+d}/10 → {resultat.get('recommandation')} "
@@ -647,6 +689,7 @@ Guide de scoring :
             "fear_greed_label":     fg_classification,
             "analyse_preliminaire": "",
             "confiance":            0,
+            "rsi":                  rsi,
         }
 
     log(f"💬 Explication : {resultat.get('explication', resultat.get('analyse_preliminaire', ''))}")
@@ -658,7 +701,7 @@ Guide de scoring :
 # ─────────────────────────────────────────────────────────────
 
 def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float,
-                        score_sentiment: int = 0) -> tuple:
+                        score_sentiment: int = 0, rsi: float = None) -> tuple:
     """
     Simule un achat ou une vente de BTC selon la recommandation de Claude.
     Applique : frais 0.1%, stop-loss -7% (absolu), trailing stop -4% depuis le max,
@@ -699,6 +742,15 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
             else:
                 log(f"📊 Trailing stop actif : seuil {seuil_trailing:,.0f} USDT "
                     f"(max: {prix_max:,.0f} USDT | actuel: {prix_btc:,.0f} USDT)")
+
+    # ── Garde-fous RSI (signal uniquement — stop-loss/trailing non bloqués) ──
+    if recommandation == "ACHETER" and rsi is not None and rsi > 70:
+        log(f"⛔ ACHETER bloqué : RSI {rsi:.1f} > 70 (surachat) → ATTENDRE")
+        recommandation = "ATTENDRE"
+
+    if recommandation == "VENDRE" and not raison_vente and rsi is not None and rsi < 30:
+        log(f"⛔ VENDRE (signal) bloqué : RSI {rsi:.1f} < 30 (survente) → ATTENDRE")
+        recommandation = "ATTENDRE"
 
     # ── Vérification cooldown post-trade (4h entre trades opposés) ──
     if recommandation in ("ACHETER", "VENDRE"):
@@ -877,6 +929,7 @@ EN_TETES_EXCEL = [
     "Raisonnement Claude",
     "Fear & Greed",
     "Trailing Stop (USDT)",
+    "RSI 14h",
 ]
 
 
@@ -914,7 +967,7 @@ def initialiser_excel():
         classeur.save(FICHIER_EXCEL)
         en_tetes_actuels = [c.value for c in feuille[1]]
         log("📁 Colonne 'News qualité 2-3' ajoutée au fichier Excel existant.")
-    for col_name in ("Raisonnement Claude", "Fear & Greed", "Trailing Stop (USDT)"):
+    for col_name in ("Raisonnement Claude", "Fear & Greed", "Trailing Stop (USDT)", "RSI 14h"):
         if col_name not in en_tetes_actuels:
             col = len(en_tetes_actuels) + 1
             cell = feuille.cell(row=1, column=col, value=col_name)
@@ -926,7 +979,7 @@ def initialiser_excel():
 
 def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
                             action: str, valeur_portfolio: float, valeur_bh: float,
-                            trailing_stop: float = None):
+                            trailing_stop: float = None, rsi: float = None):
     """Ajoute une nouvelle ligne dans le fichier Excel avec toutes les données du cycle."""
     pnl_total = valeur_portfolio - CAPITAL_DEPART_USDT
     pnl_bh    = valeur_bh - CAPITAL_DEPART_USDT
@@ -959,6 +1012,7 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
         analyse.get("analyse_preliminaire", ""),
         fg_excel,
         round(trailing_stop, 2) if trailing_stop is not None else "N/A",
+        round(rsi, 1) if rsi is not None else "N/A",
     ]
 
     classeur = openpyxl.load_workbook(FICHIER_EXCEL)
@@ -997,6 +1051,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     # ── Étape 2 : Récupérer prix + données marché (1 seul appel CoinGecko) ──
     donnees_btc = recuperer_donnees_completes_btc()
     prix_btc    = donnees_btc.get("prix", 0.0)
+    rsi         = recuperer_rsi()
 
     if not nouvelles_news:
         log("💤 Pas de nouvelles news ce cycle — vérification des stops si en position.")
@@ -1004,7 +1059,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         if portefeuille["en_position"]:
             # Vérifie trailing stop et stop-loss même sans news (crash nocturne)
             action_heartbeat, portefeuille = simuler_transaction(
-                portefeuille, "ATTENDRE", prix_btc, score_sentiment=0
+                portefeuille, "ATTENDRE", prix_btc, score_sentiment=0, rsi=rsi
             )
             if action_heartbeat == "VENDRE":
                 sauvegarder_portfolio(portefeuille)
@@ -1022,6 +1077,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
             valeur_portfolio,
             valeur_bh,
             trailing_stop=ts_heartbeat,
+            rsi=rsi,
         )
         return portefeuille
 
@@ -1035,7 +1091,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         log(f"📊 Prix de référence Buy & Hold initialisé : {prix_btc:,.2f} USDT")
 
     # ── Étapes 3 & 4 : Analyser avec Claude (données marché passées, 0 appel CoinGecko supplémentaire) ──
-    analyse = analyser_avec_claude(prix_btc, nouvelles_news, portefeuille=portefeuille, marche=donnees_btc)
+    analyse = analyser_avec_claude(prix_btc, nouvelles_news, portefeuille=portefeuille, marche=donnees_btc, rsi=rsi)
 
     # ── Étape 6 : Simuler une transaction ──
     recommandation = analyse.get("recommandation", "ATTENDRE")
@@ -1051,7 +1107,8 @@ def executer_un_cycle(portefeuille: dict) -> dict:
 
     action, portefeuille = simuler_transaction(
         portefeuille, recommandation, prix_btc,
-        score_sentiment=analyse.get("score", 0)
+        score_sentiment=analyse.get("score", 0),
+        rsi=rsi
     )
 
     # ── Sauvegarder le portefeuille ──
@@ -1066,7 +1123,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
         if pm > 0:
             ts_niveau = round(pm * (1 - TRAILING_STOP_PCT), 2)
     enregistrer_dans_excel(prix_btc, nouvelles_news, analyse, action, valeur_portfolio, valeur_bh,
-                           trailing_stop=ts_niveau)
+                           trailing_stop=ts_niveau, rsi=rsi)
 
     pnl    = valeur_portfolio - CAPITAL_DEPART_USDT
     pnl_bh = valeur_bh - CAPITAL_DEPART_USDT
