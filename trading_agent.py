@@ -605,11 +605,24 @@ def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None,
         pnl_latent_str = f"{signe}{pnl_pct:.1f}%"
 
     rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+
+    position_str = ""
+    if portefeuille and portefeuille.get("en_position") and portefeuille.get("prix_achat_btc", 0) > 0:
+        prix_achat = portefeuille["prix_achat_btc"]
+        prix_max   = portefeuille.get("prix_max_depuis_achat", prix_achat)
+        ts_niveau  = prix_max * (1 - TRAILING_STOP_PCT)
+        dist_pct   = (ts_niveau / prix_btc - 1) * 100  # négatif si le stop est sous le prix actuel
+        position_str = (
+            f"\nPosition ouverte à {prix_achat:,.0f}$ | "
+            f"Trailing stop : {ts_niveau:,.0f}$ ({dist_pct:+.1f}% depuis prix actuel {prix_btc:,.0f}$)"
+        )
+
     contexte_technique = (
         f"Prix actuel: {prix_btc:,.0f}$ | Var 1h: {var_1h:+.2f}% | "
         f"Var 24h: {var_24h:+.2f}% | Var 7j: {var_7j:+.2f}%\n"
         f"Min/Max 24h: {min_24h:,.0f}$/{max_24h:,.0f}$ | P&L latent: {pnl_latent_str}\n"
         f"Fear & Greed Index: {fg_str} | RSI 14h: {rsi_str}"
+        f"{position_str}"
     )
 
     # ── Format de réponse JSON selon le modèle ──
