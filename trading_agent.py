@@ -73,7 +73,7 @@ SEUIL_NEWS_PERTINENTES = 2
 FRAIS_TRADING         = 0.001
 STOP_LOSS_PCT         = 0.07   # protection absolue crash brutal (-7% depuis l'achat)
 TRAILING_STOP_PCT     = 0.04   # recul maximal depuis le prix max atteint (-4%)
-MIN_PNL_ATTENDU_USDT  = 1.50   # P&L net minimum pour ouvrir/fermer une position (5× frais 0,30 USDT)
+MIN_PNL_PCT           = 0.005  # P&L net minimum = 0.5% du capital engagé
 
 LIMITE_COUT_QUOTIDIEN_USD = 1.00
 FICHIER_TOKEN_USAGE       = "token_usage.json"
@@ -787,21 +787,23 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
                 f"({nb_trades} trades) → ATTENDRE")
             recommandation = "ATTENDRE"
 
-    # ── Vérification P&L attendu minimum (1,50 USDT = 5× frais) ──
+    # ── Vérification P&L attendu minimum (0.5% du capital engagé) ──
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
-        capital_dispo = portefeuille["usdt_disponible"]
+        capital_dispo     = portefeuille["usdt_disponible"]
+        seuil_achat       = capital_dispo * MIN_PNL_PCT
         pnl_attendu_achat = capital_dispo * TRAILING_STOP_PCT - 2 * capital_dispo * FRAIS_TRADING
-        if pnl_attendu_achat < MIN_PNL_ATTENDU_USDT:
-            log(f"💡 P&L attendu (ref. trailing stop: {pnl_attendu_achat:.2f} USDT) < {MIN_PNL_ATTENDU_USDT} USDT → ATTENDRE")
+        if pnl_attendu_achat < seuil_achat:
+            log(f"💡 P&L attendu (ref. trailing stop: {pnl_attendu_achat:.2f} USDT) < {seuil_achat:.2f} USDT (0.5% de {capital_dispo:.0f}) → ATTENDRE")
             recommandation = "ATTENDRE"
 
     if recommandation == "VENDRE" and portefeuille["en_position"] and not raison_vente:
-        btc_held = portefeuille["btc_en_stock"]
+        btc_held        = portefeuille["btc_en_stock"]
         val_brute_check = btc_held * prix_btc
         frais_v_check   = val_brute_check * FRAIS_TRADING
         pnl_si_vente    = val_brute_check - frais_v_check - btc_held * portefeuille["prix_achat_btc"]
-        if pnl_si_vente < MIN_PNL_ATTENDU_USDT:
-            log(f"💡 P&L si vente maintenant ({pnl_si_vente:.2f} USDT) < {MIN_PNL_ATTENDU_USDT} USDT → ATTENDRE")
+        seuil_vente     = val_brute_check * MIN_PNL_PCT
+        if pnl_si_vente < seuil_vente:
+            log(f"💡 P&L si vente maintenant ({pnl_si_vente:.2f} USDT) < {seuil_vente:.2f} USDT (0.5% de {val_brute_check:.0f}) → ATTENDRE")
             recommandation = "ATTENDRE"
 
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
