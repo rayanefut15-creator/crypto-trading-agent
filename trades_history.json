@@ -1,14 +1,14 @@
 [
   {
     "timestamp_ouverture": "2026-05-23T07:55:52.789985+00:00",
-    "timestamp_fermeture": null,
+    "timestamp_fermeture": "2026-05-27T10:42:52.345681+00:00",
     "prix_entree": 74464.0,
-    "prix_sortie": null,
-    "pnl_usdt": null,
-    "pnl_pct": null,
-    "duree_minutes": null,
+    "prix_sortie": 75774.0,
+    "pnl_usdt": 5.0634,
+    "pnl_pct": 1.66,
+    "duree_minutes": 5927.0,
     "score_sentiment": 5,
-    "raison_sortie": null,
-    "status": "open"
+    "raison_sortie": "signal",
+    "status": "closed"
   }
 ]
