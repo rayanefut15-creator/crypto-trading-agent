@@ -72,7 +72,7 @@ SEUIL_NEWS_PERTINENTES = 2
 
 FRAIS_TRADING         = 0.001
 STOP_LOSS_PCT         = 0.07   # protection absolue crash brutal (-7% depuis l'achat)
-TRAILING_STOP_PCT     = 0.04   # recul maximal depuis le prix max atteint (-4%)
+TRAILING_STOP_PCT     = 0.025  # recul maximal depuis le prix max atteint (-2.5%)
 MIN_PNL_PCT           = 0.005  # P&L net minimum = 0.5% du capital engagé
 
 LIMITE_COUT_QUOTIDIEN_USD = 1.00
@@ -81,6 +81,65 @@ COUTS_PAR_TOKEN = {
     "claude-haiku-4-5-20251001": {"input": 0.80e-6, "output": 4.00e-6},
     "claude-sonnet-4-6":         {"input": 3.00e-6, "output": 15.00e-6},
 }
+
+# ─────────────────────────────────────────────────────────────
+#  PROMPTS SYSTÈME STATIQUES — mis en cache côté Anthropic
+#  (inchangés entre cycles → éligibles au prompt caching)
+# ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT_FILTRE = """\
+Tu es un assistant de scoring de news crypto.
+Note chaque news de 0 à 3 selon son importance pour le trading BTC :
+  0 = pub / spam / hors sujet crypto
+  1 = news crypto générale (altcoins, NFT, DeFi sans lien BTC)
+  2 = news crypto directement pertinente pour le prix du BTC
+  3 = news macro importante (Fed, inflation, régulation, ETF Bitcoin, crise financière)
+
+Réponds UNIQUEMENT avec un objet JSON valide (rien d'autre autour) :
+{
+  "scores": [2, 0, 3, 1, ...]
+}
+L'ordre doit correspondre exactement à la liste. Chaque score est 0, 1, 2 ou 3."""
+
+SYSTEM_PROMPT_HAIKU = """\
+Tu es un analyste de trading crypto expérimenté et prudent.
+Analyse les données de marché et les news fournies, puis donne une recommandation de trading BTC.
+
+Réponds UNIQUEMENT avec un objet JSON valide dans ce format exact (rien d'autre autour) :
+{
+  "score": <nombre entier entre -10 et 10>,
+  "recommandation": "<ACHETER ou VENDRE ou ATTENDRE>",
+  "explication": "<2-3 phrases expliquant ta décision en français>"
+}
+
+Guide de scoring :
+- +9 à +10 : signal haussier exceptionnel  → ACHETER
+- +5 à +8  : signal haussier notable        → ACHETER
+- -4 à +4  : signal neutre                  → ATTENDRE
+- -5 à -8  : signal baissier notable        → VENDRE
+- -9 à -10 : signal baissier exceptionnel  → VENDRE"""
+
+SYSTEM_PROMPT_SONNET = """\
+Tu es un analyste de trading crypto expérimenté et prudent.
+Analyse les données de marché et les news fournies, puis donne une recommandation de trading BTC.
+
+Réponds UNIQUEMENT avec un objet JSON valide dans ce format exact (rien d'autre autour) :
+{
+  "analyse_preliminaire": "<2-3 phrases de raisonnement sur les news et le contexte de marché>",
+  "score": <nombre entier entre -10 et 10>,
+  "recommandation": "<ACHETER ou VENDRE ou ATTENDRE>",
+  "confiance": <entier de 1 (faible) à 5 (très élevé)>
+}
+
+Guide de scoring :
+- +9 à +10 : signal haussier exceptionnel  → ACHETER
+- +5 à +8  : signal haussier notable        → ACHETER
+- -4 à +4  : signal neutre                  → ATTENDRE
+- -5 à -8  : signal baissier notable        → VENDRE
+- -9 à -10 : signal baissier exceptionnel  → VENDRE"""
+
+# Compteur d'échecs RSI consécutifs (toutes sources KO sur un même cycle)
+_NB_ECHECS_RSI_CONSECUTIFS: int = 0
 
 
 # ═════════════════════════════════════════════════════════════
@@ -264,18 +323,11 @@ def recuperer_nouvelles_news() -> list:
             titres_vus.add(titre_norm)
             articles_uniques.append(article)
 
-    # Filtre anti-doublons via le cache
+    # Filtre anti-doublons via le cache (lecture seule — le cache ne sera écrit
+    # qu'à la toute fin du cycle par marquer_news_comme_traitees())
     cache = charger_cache_news()
-    maintenant = time.time()
 
-    nouvelles_news = []
-    for article in articles_uniques:
-        url = article["link"]
-        if url not in cache:
-            nouvelles_news.append(article)
-            cache[url] = maintenant
-
-    sauvegarder_cache_news(cache)
+    nouvelles_news = [a for a in articles_uniques if a["link"] not in cache]
 
     if nouvelles_news:
         log(f"✅ {len(nouvelles_news)} nouvelle(s) news détectée(s) "
@@ -284,6 +336,21 @@ def recuperer_nouvelles_news() -> list:
         log("Aucune nouvelle news depuis la dernière vérification. En attente...")
 
     return nouvelles_news
+
+
+def marquer_news_comme_traitees(articles: list):
+    """
+    Ajoute les URLs des articles traités au cache et sauvegarde le fichier.
+    Doit être appelé UNIQUEMENT après enregistrer_dans_excel(), en toute fin de cycle.
+    """
+    if not articles:
+        return
+    cache = charger_cache_news()
+    maintenant = time.time()
+    for article in articles:
+        cache[article["link"]] = maintenant
+    sauvegarder_cache_news(cache)
+    log(f"📋 {len(articles)} news marquée(s) comme traitée(s) dans le cache.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -359,19 +426,15 @@ def recuperer_donnees_completes_btc() -> dict:
 
 def recuperer_rsi(periode: int = 14) -> float:
     """
-    Calcule le RSI sur `periode` périodes 1h via l'API publique Binance.
-    Appelle GET /api/v3/klines?symbol=BTCUSDT&interval=1h&limit=15.
-    Retourne la valeur float arrondie à 1 décimale, ou None en cas d'erreur.
+    Calcule le RSI sur `periode` périodes via une chaîne de fallback :
+      1) CoinGecko OHLC (4H, accessible partout)
+      2) CryptoCompare histohour (1H, accessible partout)
+      3) Binance klines (1H, peut être bloqué géographiquement)
+    Retourne la valeur float arrondie à 1 décimale, ou None si tout échoue.
     """
-    try:
-        url = (
-            f"https://api.binance.com/api/v3/klines"
-            f"?symbol=BTCUSDT&interval=1h&limit={periode + 1}"
-        )
-        reponse = get_with_retry(url, timeout=10)
-        klines  = reponse.json()
-        closes  = [float(k[4]) for k in klines]   # indice 4 = prix de clôture
+    global _NB_ECHECS_RSI_CONSECUTIFS
 
+    def _calculer_rsi(closes: list) -> float:
         gains, pertes = [], []
         for i in range(1, len(closes)):
             delta = closes[i] - closes[i - 1]
@@ -379,22 +442,69 @@ def recuperer_rsi(periode: int = 14) -> float:
                 gains.append(delta);  pertes.append(0.0)
             else:
                 gains.append(0.0);    pertes.append(abs(delta))
-
         avg_gain = sum(gains)  / periode
         avg_loss = sum(pertes) / periode
-
         if avg_loss == 0:
-            rsi = 100.0
-        else:
-            rs  = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
+            return 100.0
+        rs = avg_gain / avg_loss
+        return round(100 - (100 / (1 + rs)), 1)
 
-        rsi = round(rsi, 1)
-        log(f"📈 RSI 14h : {rsi}")
+    # ── Source 1 : CoinGecko OHLC (données 4H sur 7 jours, ~42 bougies) ──
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days=7"
+        r = get_with_retry(url, timeout=10)
+        candles = r.json()   # [[timestamp_ms, open, high, low, close], ...]
+        closes = [float(c[4]) for c in candles]
+        if len(closes) < periode + 1:
+            raise ValueError(f"bougies insuffisantes : {len(closes)} < {periode + 1}")
+        rsi = _calculer_rsi(closes[-(periode + 1):])
+        log(f"📈 RSI source CoinGecko (4H) : OK → RSI {rsi}")
+        _NB_ECHECS_RSI_CONSECUTIFS = 0
         return rsi
     except Exception as e:
-        log(f"⚠️  RSI indisponible ({e})")
-        return None
+        log(f"⚠️  RSI source CoinGecko : KO ({e})")
+
+    # ── Source 2 : CryptoCompare histohour (données 1H) ──
+    try:
+        url = (
+            "https://min-api.cryptocompare.com/data/v2/histohour"
+            f"?fsym=BTC&tsym=USD&limit={periode + 1}"
+        )
+        r = get_with_retry(url, timeout=10)
+        data = r.json()
+        candles = data["Data"]["Data"]
+        closes = [float(c["close"]) for c in candles]
+        if len(closes) < periode + 1:
+            raise ValueError(f"bougies insuffisantes : {len(closes)} < {periode + 1}")
+        rsi = _calculer_rsi(closes[-(periode + 1):])
+        log(f"📈 RSI source CryptoCompare (1H) : OK → RSI {rsi}")
+        _NB_ECHECS_RSI_CONSECUTIFS = 0
+        return rsi
+    except Exception as e:
+        log(f"⚠️  RSI source CryptoCompare : KO ({e})")
+
+    # ── Source 3 : Binance klines (1H, dernier recours — peut être bloqué GH Actions) ──
+    try:
+        url = (
+            f"https://api.binance.com/api/v3/klines"
+            f"?symbol=BTCUSDT&interval=1h&limit={periode + 1}"
+        )
+        r = get_with_retry(url, timeout=10)
+        klines = r.json()
+        closes = [float(k[4]) for k in klines]   # indice 4 = prix de clôture
+        rsi = _calculer_rsi(closes)
+        log(f"📈 RSI source Binance (1H) : OK → RSI {rsi}")
+        _NB_ECHECS_RSI_CONSECUTIFS = 0
+        return rsi
+    except Exception as e:
+        log(f"⚠️  RSI source Binance : KO ({e})")
+
+    _NB_ECHECS_RSI_CONSECUTIFS += 1
+    log(
+        f"❌ RSI 3 sources KO consécutives — garde-fou RSI désactivé ce cycle "
+        f"(échecs consécutifs : {_NB_ECHECS_RSI_CONSECUTIFS})"
+    )
+    return None
 
 
 def recuperer_fear_greed() -> dict:
@@ -429,13 +539,28 @@ def charger_usage_quotidien() -> dict:
     return {"date": today, "cout_total_usd": 0.0, "nb_appels": 0}
 
 
-def enregistrer_et_verifier_tokens(modele: str, input_tokens: int, output_tokens: int) -> float:
+def enregistrer_et_verifier_tokens(
+    modele: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
     """
-    Comptabilise les tokens du dernier appel Claude, sauvegarde, et déclenche le
-    kill-switch si la limite quotidienne est atteinte.
+    Comptabilise les tokens du dernier appel Claude (y compris les tokens de cache),
+    sauvegarde, et déclenche le kill-switch si la limite quotidienne est atteinte.
+
+    Tarification cache Anthropic :
+      - cache_read_tokens  : 0.10× le prix normal d'entrée
+      - cache_write_tokens : 1.25× le prix normal d'entrée (TTL 5 min)
     """
-    tarifs    = COUTS_PAR_TOKEN.get(modele, {"input": 3.00e-6, "output": 15.00e-6})
-    cout_appel = input_tokens * tarifs["input"] + output_tokens * tarifs["output"]
+    tarifs = COUTS_PAR_TOKEN.get(modele, {"input": 3.00e-6, "output": 15.00e-6})
+    cout_appel = (
+        input_tokens        * tarifs["input"]
+        + output_tokens     * tarifs["output"]
+        + cache_read_tokens  * tarifs["input"] * 0.10
+        + cache_write_tokens * tarifs["input"] * 1.25
+    )
 
     usage = charger_usage_quotidien()
     usage["cout_total_usd"] += cout_appel
@@ -445,8 +570,16 @@ def enregistrer_et_verifier_tokens(modele: str, input_tokens: int, output_tokens
         json.dump(usage, f, indent=2)
 
     pct = usage["cout_total_usd"] / LIMITE_COUT_QUOTIDIEN_USD * 100
-    log(f"💳 Appel : ${cout_appel:.4f} | Jour : ${usage['cout_total_usd']:.4f} "
-        f"/ ${LIMITE_COUT_QUOTIDIEN_USD:.2f} ({pct:.1f}%)")
+    cache_info = ""
+    if cache_read_tokens or cache_write_tokens:
+        cache_info = (
+            f" | cache_hit={cache_read_tokens:,} "
+            f"cache_write={cache_write_tokens:,}"
+        )
+    log(
+        f"💳 Appel : ${cout_appel:.4f} | Jour : ${usage['cout_total_usd']:.4f} "
+        f"/ ${LIMITE_COUT_QUOTIDIEN_USD:.2f} ({pct:.1f}%){cache_info}"
+    )
 
     if usage["cout_total_usd"] >= LIMITE_COUT_QUOTIDIEN_USD:
         raise LimiteQuotidienneAtteinte(
@@ -480,28 +613,30 @@ def prefiltrer_news_haiku(articles: list, client: anthropic.Anthropic) -> tuple:
     for i, article in enumerate(articles, 1):
         liste_titres += f"\n{i}. {article.get('title', 'Sans titre')}"
 
-    prompt_filtre = f"""Note chaque news de 0 à 3 selon son importance pour le trading BTC :
-  0 = pub / spam / hors sujet crypto
-  1 = news crypto générale (altcoins, NFT, DeFi sans lien BTC)
-  2 = news crypto directement pertinente pour le prix du BTC
-  3 = news macro importante (Fed, inflation, régulation, ETF Bitcoin, crise financière)
-
-NEWS :{liste_titres}
-
-Réponds UNIQUEMENT avec un objet JSON valide (rien d'autre autour) :
-{{
-  "scores": [2, 0, 3, 1, ...]
-}}
-L'ordre doit correspondre exactement à la liste. Chaque score est 0, 1, 2 ou 3."""
+    # Seule la liste de titres varie — le guide de scoring est dans le system (mis en cache)
+    message_utilisateur = f"NEWS :{liste_titres}"
 
     try:
         reponse = client.messages.create(
             model=MODELE_HAIKU,
             max_tokens=256,
-            messages=[{"role": "user", "content": prompt_filtre}]
+            system=[{
+                "type": "text",
+                "text": SYSTEM_PROMPT_FILTRE,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": message_utilisateur}],
         )
+        cache_read  = getattr(reponse.usage, "cache_read_input_tokens",  0) or 0
+        cache_write = getattr(reponse.usage, "cache_creation_input_tokens", 0) or 0
+        log(f"🗂️  Filtre Haiku — input={reponse.usage.input_tokens} "
+            f"cache_hit={cache_read} cache_write={cache_write}")
         enregistrer_et_verifier_tokens(
-            MODELE_HAIKU, reponse.usage.input_tokens, reponse.usage.output_tokens
+            MODELE_HAIKU,
+            reponse.usage.input_tokens,
+            reponse.usage.output_tokens,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
         )
         contenu = reponse.content[0].text.strip()
         debut = contenu.find("{")
@@ -625,39 +760,14 @@ def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None,
         f"{position_str}"
     )
 
-    # ── Format de réponse JSON selon le modèle ──
-    if modele_decision == MODELE_SONNET:
-        format_json = """{
-  "analyse_preliminaire": "<2-3 phrases de raisonnement sur les news et le contexte de marché>",
-  "score": <nombre entier entre -10 et 10>,
-  "recommandation": "<ACHETER ou VENDRE ou ATTENDRE>",
-  "confiance": <entier de 1 (faible) à 5 (très élevé)>
-}"""
-    else:
-        format_json = """{
-  "score": <nombre entier entre -10 et 10>,
-  "recommandation": "<ACHETER ou VENDRE ou ATTENDRE>",
-  "explication": "<2-3 phrases expliquant ta décision en français>"
-}"""
+    # Le system prompt statique (rôle + format JSON + guide de scoring) est mis en cache.
+    # Seul le contexte variable du cycle (prix, news, RSI, position) est dans le user message.
+    system_prompt = SYSTEM_PROMPT_SONNET if modele_decision == MODELE_SONNET else SYSTEM_PROMPT_HAIKU
 
-    prompt_analyse = f"""Tu es un analyste de trading crypto expérimenté et prudent.
-Analyse les informations suivantes et donne une recommandation de trading BTC.
-
-CONTEXTE DE MARCHÉ :
-{contexte_technique}
-
-NEWS QUALITÉ 2-3 ({nb_qualite} sélectionnées sur {len(news)}) :
-{resume_news}
-
-Réponds UNIQUEMENT avec un objet JSON valide dans ce format exact (rien d'autre autour) :
-{format_json}
-
-Guide de scoring :
-- +9 à +10 : signal haussier exceptionnel  → ACHETER
-- +5 à +8  : signal haussier notable        → ACHETER
-- -4 à +4  : signal neutre                  → ATTENDRE
-- -5 à -8  : signal baissier notable        → VENDRE
-- -9 à -10 : signal baissier exceptionnel  → VENDRE"""
+    message_utilisateur = (
+        f"CONTEXTE DE MARCHÉ :\n{contexte_technique}\n\n"
+        f"NEWS QUALITÉ 2-3 ({nb_qualite} sélectionnées sur {len(news)}) :\n{resume_news}"
+    )
 
     log(f"🤖 Décision en cours avec {modele_decision}...")
 
@@ -665,10 +775,23 @@ Guide de scoring :
         reponse = client.messages.create(
             model=modele_decision,
             max_tokens=512 if modele_decision == MODELE_HAIKU else 1024,
-            messages=[{"role": "user", "content": prompt_analyse}]
+            system=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": message_utilisateur}],
         )
+        cache_read  = getattr(reponse.usage, "cache_read_input_tokens",  0) or 0
+        cache_write = getattr(reponse.usage, "cache_creation_input_tokens", 0) or 0
+        log(f"🗂️  Analyse {modele_decision} — input={reponse.usage.input_tokens} "
+            f"cache_hit={cache_read} cache_write={cache_write}")
         enregistrer_et_verifier_tokens(
-            modele_decision, reponse.usage.input_tokens, reponse.usage.output_tokens
+            modele_decision,
+            reponse.usage.input_tokens,
+            reponse.usage.output_tokens,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
         )
         contenu = reponse.content[0].text.strip()
         debut   = contenu.find("{")
@@ -1030,6 +1153,9 @@ def enregistrer_dans_excel(prix_btc: float, news: list, analyse: dict,
         round(rsi, 1) if rsi is not None else "N/A",
     ]
 
+    rsi_excel = nouvelle_ligne[-1]
+    log(f"🔍 RSI → Excel : {rsi_excel!r} (paramètre reçu : {rsi!r})")
+
     classeur = openpyxl.load_workbook(FICHIER_EXCEL)
     feuille  = classeur.active
     feuille.append(nouvelle_ligne)
@@ -1060,6 +1186,12 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     log("🔄 Nouveau cycle d'analyse")
     log(separateur)
 
+    if _NB_ECHECS_RSI_CONSECUTIFS >= 3:
+        log(
+            f"🚨 ALERTE RSI : {_NB_ECHECS_RSI_CONSECUTIFS} cycles consécutifs sans RSI "
+            f"— toutes les sources API RSI sont KO (CoinGecko / CryptoCompare / Binance)"
+        )
+
     # ── Étape 1 : Vérifier les nouvelles news ──
     nouvelles_news = recuperer_nouvelles_news()
 
@@ -1067,6 +1199,7 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     donnees_btc = recuperer_donnees_completes_btc()
     prix_btc    = donnees_btc.get("prix", 0.0)
     rsi         = recuperer_rsi()
+    log(f"🔍 RSI cycle : {rsi!r} {'✅ numérique' if isinstance(rsi, float) else '❌ None → Excel = N/A'}")
 
     if not nouvelles_news:
         log("💤 Pas de nouvelles news ce cycle — vérification des stops si en position.")
@@ -1139,6 +1272,11 @@ def executer_un_cycle(portefeuille: dict) -> dict:
             ts_niveau = round(pm * (1 - TRAILING_STOP_PCT), 2)
     enregistrer_dans_excel(prix_btc, nouvelles_news, analyse, action, valeur_portfolio, valeur_bh,
                            trailing_stop=ts_niveau, rsi=rsi)
+
+    # Marquer les news comme traitées UNIQUEMENT ici, après succès complet du cycle.
+    # Si une exception a été levée avant (Claude crash, LimiteQuotidienneAtteinte, etc.),
+    # cette ligne n'est jamais atteinte et les news restent disponibles au cycle suivant.
+    marquer_news_comme_traitees(nouvelles_news)
 
     pnl    = valeur_portfolio - CAPITAL_DEPART_USDT
     pnl_bh = valeur_bh - CAPITAL_DEPART_USDT
