@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Trading BTC</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <style>
+    :root {
+      --bg:         #0d0d14;
+      --card:       #161622;
+      --border:     #252535;
+      --text:       #e0e0e0;
+      --muted:      #8888aa;
+      --agent:      #378ADD;
+      --bh:         #1D9E75;
+      --gain:       #1D9E75;
+      --loss:       #D85A30;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    #app {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px 16px 48px;
+    }
+
+    /* ── Loader ── */
+    #loader {
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      z-index: 100;
+      transition: opacity .3s;
+    }
+    #loader.hidden { opacity: 0; pointer-events: none; }
+    .spinner {
+      width: 40px; height: 40px;
+      border: 3px solid var(--border);
+      border-top-color: var(--agent);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Error ── */
+    #error-banner {
+      background: rgba(216,90,48,.12);
+      border: 1px solid var(--loss);
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      display: none;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--agent);
+      flex: 1;
+      min-width: 160px;
+    }
+    #last-update { color: var(--muted); font-size: 12px; }
+    #status-badge {
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .badge-position {
+      background: rgba(29,158,117,.15);
+      color: var(--gain);
+      border: 1px solid rgba(29,158,117,.5);
+    }
+    .badge-cash {
+      background: rgba(55,138,221,.12);
+      color: var(--agent);
+      border: 1px solid rgba(55,138,221,.4);
+    }
+
+    /* ── KPI grid ── */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .kpi-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .kpi-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .kpi-value {
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .kpi-sub {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    /* ── Colors ── */
+    .c-gain { color: var(--gain) !important; }
+    .c-loss { color: var(--loss) !important; }
+    .c-agent { color: var(--agent) !important; }
+    .c-muted { color: var(--muted) !important; }
+
+    /* ── Chart card ── */
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    .chart-header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .chart-header h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      flex: 1;
+    }
+    .chart-legend {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .legend-item { display: flex; align-items: center; gap: 5px; }
+    .legend-line {
+      width: 20px; height: 3px;
+      border-radius: 2px;
+    }
+    .legend-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+    }
+    .chart-container { position: relative; height: 300px; }
+
+    /* ── Position encart ── */
+    #position-encart {
+      background: linear-gradient(135deg, rgba(29,158,117,.08) 0%, rgba(22,22,34,.9) 100%);
+      border: 1px solid rgba(29,158,117,.4);
+      border-radius: 10px;
+      padding: 16px 20px;
+      margin-bottom: 24px;
+    }
+    #position-encart.hidden { display: none; }
+    .pos-header {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--gain);
+      margin-bottom: 14px;
+    }
+    .pos-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+    .pos-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .pos-value {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    /* ── Table card ── */
+    .table-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 24px;
+    }
+    .table-card h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .table-wrapper { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      padding: 10px 16px;
+      text-align: left;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody tr {
+      border-bottom: 1px solid rgba(37,37,53,.7);
+      transition: background .12s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(255,255,255,.025); }
+    tbody td { padding: 10px 16px; white-space: nowrap; font-size: 13px; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+    .badge-buy {
+      background: rgba(29,158,117,.18);
+      color: var(--gain);
+      border: 1px solid rgba(29,158,117,.4);
+    }
+    .badge-sell {
+      background: rgba(216,90,48,.18);
+      color: var(--loss);
+      border: 1px solid rgba(216,90,48,.4);
+    }
+
+    /* ── Footer ── */
+    #refresh-info {
+      text-align: center;
+      font-size: 11px;
+      color: var(--muted);
+      padding-top: 8px;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 640px) {
+      header h1 { font-size: 1.15rem; }
+      .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+      .chart-container { height: 220px; }
+      .pos-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Loader overlay -->
+<div id="loader">
+  <div class="spinner"></div>
+  <div style="color:var(--muted);font-size:13px">Chargement du dashboard…</div>
+</div>
+
+<div id="app">
+  <div id="error-banner"></div>
+
+  <!-- Header -->
+  <header>
+    <h1>Agent Trading BTC</h1>
+    <div id="last-update">—</div>
+    <div id="status-badge" class="badge-cash">○ En Cash</div>
+  </header>
+
+  <!-- KPI cards -->
+  <section class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">Capital Agent</div>
+      <div class="kpi-value" id="kpi-capital">—</div>
+      <div class="kpi-sub" id="kpi-capital-sub">&nbsp;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">P&L Agent</div>
+      <div class="kpi-value" id="kpi-pnl-pct">—</div>
+      <div class="kpi-sub" id="kpi-pnl-usdt">&nbsp;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Valeur B&H</div>
+      <div class="kpi-value" id="kpi-bh-val">—</div>
+      <div class="kpi-sub" id="kpi-bh-sub">&nbsp;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">P&L B&H</div>
+      <div class="kpi-value" id="kpi-bh-pnl">—</div>
+      <div class="kpi-sub" id="kpi-bh-pnl-sub">&nbsp;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Écart vs B&H</div>
+      <div class="kpi-value" id="kpi-ecart">—</div>
+      <div class="kpi-sub" id="kpi-ecart-sub">&nbsp;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Prix BTC</div>
+      <div class="kpi-value" id="kpi-btc">—</div>
+      <div class="kpi-sub" id="kpi-btc-sub">&nbsp;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">RSI 14h</div>
+      <div class="kpi-value" id="kpi-rsi">—</div>
+      <div class="kpi-sub" id="kpi-rsi-sub">&nbsp;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Fear & Greed</div>
+      <div class="kpi-value" id="kpi-fg">—</div>
+      <div class="kpi-sub" id="kpi-fg-sub">&nbsp;</div>
+    </div>
+  </section>
+
+  <!-- Chart -->
+  <div class="chart-card">
+    <div class="chart-header">
+      <h2>Capital Agent vs Buy &amp; Hold</h2>
+      <div class="chart-legend">
+        <div class="legend-item">
+          <div class="legend-line" style="background:var(--agent)"></div>
+          <span>Agent</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-line" style="background:var(--bh);border-top:2px dashed var(--bh);height:0"></div>
+          <span>B&H</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:var(--gain)"></div>
+          <span>Achat</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:var(--loss)"></div>
+          <span>Vente</span>
+        </div>
+      </div>
+    </div>
+    <div class="chart-container">
+      <canvas id="main-chart"></canvas>
+    </div>
+  </div>
+
+  <!-- Position encart (visible only when in position) -->
+  <div id="position-encart" class="hidden">
+    <div class="pos-header">● Position ouverte</div>
+    <div class="pos-grid">
+      <div>
+        <div class="pos-label">Prix d'achat</div>
+        <div class="pos-value" id="pos-prix-achat">—</div>
+      </div>
+      <div>
+        <div class="pos-label">P&L latent</div>
+        <div class="pos-value" id="pos-pnl-latent">—</div>
+      </div>
+      <div>
+        <div class="pos-label">Trailing Stop</div>
+        <div class="pos-value" id="pos-trailing">—</div>
+      </div>
+      <div>
+        <div class="pos-label">Distance au Stop</div>
+        <div class="pos-value" id="pos-distance">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trades table -->
+  <div class="table-card">
+    <h2>Historique des Trades</h2>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Action</th>
+            <th>Prix BTC</th>
+            <th>Score</th>
+            <th>Modèle</th>
+            <th>P&L Trade</th>
+          </tr>
+        </thead>
+        <tbody id="trades-tbody">
+          <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Chargement…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="refresh-info">Prochain refresh dans <span id="countdown">15:00</span></div>
+</div>
+
+<script>
+  'use strict';
+
+  const BASE = 'https://raw.githubusercontent.com/rayanefut15-creator/crypto-trading-agent/main/';
+  const CAPITAL_INITIAL = 300;
+
+  let chartInstance = null;
+  let refreshTimer   = null;
+  let countdownEnd   = 0;
+
+  // ─── Formatters ─────────────────────────────────────────────────────────────
+
+  function fmt(n, dec = 2) {
+    if (n == null || isNaN(n)) return '—';
+    return Number(n).toLocaleString('fr-FR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+  }
+
+  function fmtPct(n) {
+    if (n == null || isNaN(n)) return '—';
+    return (n >= 0 ? '+' : '') + fmt(n) + '%';
+  }
+
+  function colorClass(n) {
+    if (n == null || isNaN(n)) return '';
+    return n >= 0 ? 'c-gain' : 'c-loss';
+  }
+
+  function set(id, html, cls = '') {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.innerHTML = html;
+    if (cls) el.className = cls;
+  }
+
+  // ─── XLSX date helpers ───────────────────────────────────────────────────────
+
+  function rowDate(r) {
+    const d = r['Date'];
+    if (!d) return '';
+    if (d instanceof Date) return d.toISOString().substring(0, 10);
+    return String(d).substring(0, 10);
+  }
+
+  function rowTime(r) {
+    const h = r['Heure'];
+    if (!h) return '';
+    if (h instanceof Date) {
+      const hh = String(h.getHours()).padStart(2, '0');
+      const mm = String(h.getMinutes()).padStart(2, '0');
+      return hh + ':' + mm;
+    }
+    return String(h).substring(0, 5);
+  }
+
+  // ─── Fetchers ────────────────────────────────────────────────────────────────
+
+  async function fetchJSON(path) {
+    const r = await fetch(BASE + path + '?nc=' + Date.now());
+    if (!r.ok) throw new Error(path + ' → HTTP ' + r.status);
+    return r.json();
+  }
+
+  async function fetchXLSX(path) {
+    const r = await fetch(BASE + path + '?nc=' + Date.now());
+    if (!r.ok) throw new Error(path + ' → HTTP ' + r.status);
+    const buf = await r.arrayBuffer();
+    const wb  = XLSX.read(buf, { type: 'array', cellDates: true });
+    const ws  = wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(ws, { raw: false, dateNF: 'yyyy-mm-dd' });
+  }
+
+  // ─── Header ──────────────────────────────────────────────────────────────────
+
+  function updateHeader(portfolio, rows) {
+    const last = rows[rows.length - 1];
+    const ts   = rowDate(last) + ' ' + rowTime(last) + ' UTC';
+    document.getElementById('last-update').textContent = 'Màj : ' + ts;
+
+    const badge = document.getElementById('status-badge');
+    if (portfolio.en_position) {
+      badge.textContent = '● En Position';
+      badge.className   = 'badge-position';
+    } else {
+      badge.textContent = '○ En Cash';
+      badge.className   = 'badge-cash';
+    }
+  }
+
+  // ─── KPIs ────────────────────────────────────────────────────────────────────
+
+  function updateKPIs(portfolio, rows) {
+    const last   = rows[rows.length - 1];
+    const prixBtc = parseFloat(last['Prix BTC (USDT)']) || 0;
+
+    // Capital agent
+    const usdt    = parseFloat(portfolio.usdt_disponible) || 0;
+    const btcQty  = parseFloat(portfolio.btc_en_stock)    || 0;
+    const capital = portfolio.en_position ? (usdt + btcQty * prixBtc) : usdt;
+    const pnlU    = capital - CAPITAL_INITIAL;
+    const pnlP    = (pnlU / CAPITAL_INITIAL) * 100;
+
+    set('kpi-capital',     fmt(capital) + ' USDT');
+    set('kpi-capital-sub', portfolio.en_position ? 'En position' : 'Liquidités', 'kpi-sub c-muted');
+    set('kpi-pnl-pct',  fmtPct(pnlP), 'kpi-value ' + colorClass(pnlP));
+    set('kpi-pnl-usdt', (pnlU >= 0 ? '+' : '') + fmt(pnlU) + ' USDT', 'kpi-sub ' + colorClass(pnlU));
+
+    // B&H
+    const bhVal = parseFloat(last['Valeur B&H (USDT)']) || 0;
+    const bhPnlU = parseFloat(last['P&L B&H (USDT)'])   || 0;
+    const bhPnlP = bhVal > 0 ? (bhPnlU / CAPITAL_INITIAL) * 100 : 0;
+
+    set('kpi-bh-val',     bhVal > 0 ? fmt(bhVal) + ' USDT' : '—');
+    set('kpi-bh-sub',     bhVal > 0 ? 'Depuis ' + fmt(parseFloat(portfolio.prix_initial_bh), 0) + ' $' : '&nbsp;', 'kpi-sub c-muted');
+    set('kpi-bh-pnl',     fmtPct(bhPnlP), 'kpi-value ' + colorClass(bhPnlP));
+    set('kpi-bh-pnl-sub', (bhPnlU >= 0 ? '+' : '') + fmt(bhPnlU) + ' USDT', 'kpi-sub ' + colorClass(bhPnlU));
+
+    // Écart
+    const ecartU = capital - bhVal;
+    const ecartP = bhVal > 0 ? ((capital - bhVal) / bhVal) * 100 : 0;
+    set('kpi-ecart',     fmtPct(ecartP), 'kpi-value ' + colorClass(ecartP));
+    set('kpi-ecart-sub', (ecartU >= 0 ? '+' : '') + fmt(ecartU) + ' USDT', 'kpi-sub ' + colorClass(ecartU));
+
+    // Prix BTC
+    set('kpi-btc',     prixBtc > 0 ? '$' + fmt(prixBtc, 0) : '—');
+    set('kpi-btc-sub', 'Dernier cycle', 'kpi-sub c-muted');
+
+    // RSI
+    const rsi = parseFloat(last['RSI 14h']);
+    if (!isNaN(rsi)) {
+      const rsiCls   = rsi > 70 ? 'c-loss' : rsi < 30 ? 'c-gain' : '';
+      const rsiLabel = rsi > 70 ? 'Suracheté' : rsi < 30 ? 'Survendu' : 'Neutre';
+      set('kpi-rsi',     fmt(rsi, 1), 'kpi-value ' + rsiCls);
+      set('kpi-rsi-sub', rsiLabel, 'kpi-sub c-muted');
+    } else {
+      set('kpi-rsi', '—'); set('kpi-rsi-sub', '&nbsp;');
+    }
+
+    // Fear & Greed
+    const fg = parseInt(last['Fear & Greed']);
+    if (!isNaN(fg)) {
+      let fgLabel, fgCls;
+      if      (fg <= 20) { fgLabel = 'Peur extrême';    fgCls = 'c-gain'; }
+      else if (fg <= 40) { fgLabel = 'Peur';             fgCls = 'c-gain'; }
+      else if (fg <= 60) { fgLabel = 'Neutre';           fgCls = ''; }
+      else if (fg <= 80) { fgLabel = 'Avidité';          fgCls = 'c-loss'; }
+      else               { fgLabel = 'Avidité extrême';  fgCls = 'c-loss'; }
+      set('kpi-fg',     String(fg), 'kpi-value ' + fgCls);
+      set('kpi-fg-sub', fgLabel, 'kpi-sub c-muted');
+    } else {
+      set('kpi-fg', '—'); set('kpi-fg-sub', '&nbsp;');
+    }
+  }
+
+  // ─── Chart ───────────────────────────────────────────────────────────────────
+
+  function updateChart(rows) {
+    // Sample to ~200 pts max (always keep last row)
+    const MAX = 200;
+    let pts = rows;
+    if (rows.length > MAX) {
+      const step = Math.ceil(rows.length / MAX);
+      pts = rows.filter((_, i) => i % step === 0 || i === rows.length - 1);
+    }
+
+    const labels = pts.map(r => {
+      const d = rowDate(r).substring(5);  // MM-DD
+      const t = rowTime(r);
+      return d + ' ' + t;
+    });
+
+    const agentData = pts.map(r => {
+      const v = parseFloat(r['Capital fictif (USDT)']);
+      return isNaN(v) ? null : v;
+    });
+
+    const bhData = pts.map(r => {
+      const v = parseFloat(r['Valeur B&H (USDT)']);
+      return isNaN(v) ? null : v;
+    });
+
+    // Buy / sell marker datasets (showLine: false = scatter-like on category scale)
+    const buyData  = agentData.map((v, i) => {
+      const rec = (pts[i]['Recommandation'] || '').trim().toUpperCase();
+      return rec === 'ACHETER' ? v : null;
+    });
+    const sellData = agentData.map((v, i) => {
+      const rec = (pts[i]['Recommandation'] || '').trim().toUpperCase();
+      return rec === 'VENDRE' ? v : null;
+    });
+
+    const ctx = document.getElementById('main-chart').getContext('2d');
+    if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+
+    chartInstance = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'Capital Agent',
+            data: agentData,
+            borderColor: '#378ADD',
+            backgroundColor: 'rgba(55,138,221,.07)',
+            borderWidth: 2,
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            tension: 0.25,
+            fill: true,
+            order: 3
+          },
+          {
+            label: 'Buy & Hold',
+            data: bhData,
+            borderColor: '#1D9E75',
+            backgroundColor: 'transparent',
+            borderWidth: 1.5,
+            borderDash: [6, 5],
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            tension: 0.25,
+            fill: false,
+            order: 4
+          },
+          {
+            label: 'Achats',
+            data: buyData,
+            borderColor: 'transparent',
+            backgroundColor: '#1D9E75',
+            borderWidth: 0,
+            pointRadius: 7,
+            pointHoverRadius: 9,
+            pointStyle: 'circle',
+            showLine: false,
+            spanGaps: false,
+            order: 1
+          },
+          {
+            label: 'Ventes',
+            data: sellData,
+            borderColor: 'transparent',
+            backgroundColor: '#D85A30',
+            borderWidth: 0,
+            pointRadius: 7,
+            pointHoverRadius: 9,
+            pointStyle: 'circle',
+            showLine: false,
+            spanGaps: false,
+            order: 2
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#1e1e2e',
+            borderColor: '#252535',
+            borderWidth: 1,
+            titleColor: '#e0e0e0',
+            bodyColor: '#8888aa',
+            callbacks: {
+              label: ctx => {
+                if (ctx.parsed.y == null) return null;
+                const names = { 'Capital Agent': 'Agent', 'Buy & Hold': 'B&H', 'Achats': '▲ Achat', 'Ventes': '▼ Vente' };
+                const lbl = names[ctx.dataset.label] || ctx.dataset.label;
+                return lbl + ': ' + fmt(ctx.parsed.y) + ' USDT';
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            ticks: {
+              color: '#8888aa',
+              font: { size: 10 },
+              maxTicksLimit: 8,
+              maxRotation: 0,
+              autoSkip: true
+            },
+            grid: { color: 'rgba(255,255,255,.04)' }
+          },
+          y: {
+            ticks: {
+              color: '#8888aa',
+              font: { size: 10 },
+              callback: v => fmt(v, 0) + ' $'
+            },
+            grid: { color: 'rgba(255,255,255,.04)' }
+          }
+        }
+      }
+    });
+  }
+
+  // ─── Position encart ─────────────────────────────────────────────────────────
+
+  function updatePositionEncart(portfolio, rows) {
+    const encart = document.getElementById('position-encart');
+    if (!portfolio.en_position) {
+      encart.classList.add('hidden');
+      return;
+    }
+    encart.classList.remove('hidden');
+
+    const last       = rows[rows.length - 1];
+    const prixBtc    = parseFloat(last['Prix BTC (USDT)']) || 0;
+    const prixAchat  = parseFloat(portfolio.prix_achat_btc) || 0;
+    const trailing   = parseFloat(last['Trailing Stop (USDT)']) || 0;
+
+    const pnlLatent  = prixAchat > 0 ? ((prixBtc - prixAchat) / prixAchat) * 100 : 0;
+    const distStop   = (trailing > 0 && prixBtc > 0) ? ((prixBtc - trailing) / prixBtc) * 100 : null;
+
+    set('pos-prix-achat', prixAchat > 0 ? '$' + fmt(prixAchat, 0) : '—');
+
+    const pnlEl = document.getElementById('pos-pnl-latent');
+    pnlEl.textContent = fmtPct(pnlLatent);
+    pnlEl.className   = 'pos-value ' + colorClass(pnlLatent);
+
+    set('pos-trailing', trailing > 0 ? '$' + fmt(trailing, 0) : '—');
+
+    const distEl = document.getElementById('pos-distance');
+    if (distStop != null) {
+      distEl.textContent = fmt(distStop) + '% au-dessus';
+      distEl.className   = 'pos-value ' + (distStop < 2 ? 'c-loss' : 'c-gain');
+    } else {
+      distEl.textContent = '—';
+      distEl.className   = 'pos-value';
+    }
+  }
+
+  // ─── Trades table ────────────────────────────────────────────────────────────
+
+  function updateTradesTable(rows, trades) {
+    const tbody = document.getElementById('trades-tbody');
+
+    // Filter trade events from xlsx (ACHETER / VENDRE only), newest first
+    const events = rows
+      .filter(r => {
+        const rec = (r['Recommandation'] || '').trim().toUpperCase();
+        return rec === 'ACHETER' || rec === 'VENDRE';
+      })
+      .slice()
+      .reverse();
+
+    // Index closed trades from trades_history by closing date for P&L lookup
+    const closedByDate = {};
+    if (trades) {
+      trades
+        .filter(t => t.status === 'closed' && t.timestamp_fermeture)
+        .forEach(t => {
+          const k = t.timestamp_fermeture.substring(0, 10);
+          if (!closedByDate[k]) closedByDate[k] = [];
+          closedByDate[k].push(t);
+        });
+    }
+
+    if (events.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Aucun trade enregistré</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = events.map(r => {
+      const rec   = (r['Recommandation'] || '').trim().toUpperCase();
+      const isBuy = rec === 'ACHETER';
+      const date  = rowDate(r) + ' ' + rowTime(r);
+      const prix  = parseFloat(r['Prix BTC (USDT)']);
+      const score = parseInt(r['Score sentiment']);
+      const model = (r['Modèle Claude utilisé'] || '')
+        .replace('claude-', '')
+        .replace(/-\d{8,}$/, '');  // strip date suffix like -20251001
+
+      // P&L lookup for VENDRE rows
+      let pnlHtml = '<span style="color:var(--muted)">—</span>';
+      if (!isBuy) {
+        const key    = rowDate(r);
+        const bucket = closedByDate[key] || [];
+        // Find trade whose exit price is close to this row's price
+        const match  = bucket.find(t => Math.abs(parseFloat(t.prix_sortie) - prix) < 500) || bucket[0];
+        if (match && match.pnl_usdt != null) {
+          const pnl    = match.pnl_usdt;
+          const pnlPct = match.pnl_pct;
+          const sign   = pnl >= 0 ? '+' : '';
+          const cls    = pnl >= 0 ? 'c-gain' : 'c-loss';
+          pnlHtml = `<span class="${cls}">${sign}${fmt(pnl)} USDT (${fmtPct(pnlPct)})</span>`;
+        }
+      }
+
+      return `
+        <tr>
+          <td style="color:var(--muted);font-size:12px">${date}</td>
+          <td><span class="badge ${isBuy ? 'badge-buy' : 'badge-sell'}">${isBuy ? 'ACHAT' : 'VENTE'}</span></td>
+          <td>$${isNaN(prix) ? '—' : fmt(prix, 0)}</td>
+          <td style="color:var(--muted)">${isNaN(score) ? '—' : score}</td>
+          <td style="font-size:11px;color:var(--muted)">${model || '—'}</td>
+          <td>${pnlHtml}</td>
+        </tr>`;
+    }).join('');
+  }
+
+  // ─── Countdown ───────────────────────────────────────────────────────────────
+
+  function startCountdown(ms) {
+    countdownEnd = Date.now() + ms;
+    const el = document.getElementById('countdown');
+    (function tick() {
+      const rem = Math.max(0, countdownEnd - Date.now());
+      const m   = Math.floor(rem / 60000);
+      const s   = Math.floor((rem % 60000) / 1000);
+      el.textContent = m + ':' + String(s).padStart(2, '0');
+      if (rem > 0) setTimeout(tick, 1000);
+    })();
+  }
+
+  // ─── Main load ───────────────────────────────────────────────────────────────
+
+  async function loadDashboard() {
+    const errBanner = document.getElementById('error-banner');
+    errBanner.style.display = 'none';
+
+    try {
+      const [portfolio, xlsxRows, trades] = await Promise.all([
+        fetchJSON('portfolio_state.json'),
+        fetchXLSX('trading_journal.xlsx'),
+        fetchJSON('trades_history.json').catch(() => null)
+      ]);
+
+      // Keep only rows with a valid capital value
+      const validRows = xlsxRows.filter(r => {
+        const v = parseFloat(r['Capital fictif (USDT)']);
+        return !isNaN(v) && v > 0;
+      });
+
+      if (validRows.length === 0) throw new Error('Aucune donnée valide dans le journal XLSX');
+
+      updateHeader(portfolio, validRows);
+      updateKPIs(portfolio, validRows);
+      updateChart(validRows);
+      updatePositionEncart(portfolio, validRows);
+      updateTradesTable(validRows, trades);
+
+      document.getElementById('loader').classList.add('hidden');
+    } catch (err) {
+      document.getElementById('loader').classList.add('hidden');
+      errBanner.style.display = 'block';
+      errBanner.innerHTML = '&#9888; Erreur de chargement : ' + err.message +
+        '<br><small style="color:var(--muted)">Vérifiez que le repo GitHub est public et que les fichiers existent sur main.</small>';
+      console.error(err);
+    }
+
+    // Schedule next refresh
+    const INTERVAL = 15 * 60 * 1000;
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(loadDashboard, INTERVAL);
+    startCountdown(INTERVAL);
+  }
+
+  loadDashboard();
+</script>
+</body>
+</html>
