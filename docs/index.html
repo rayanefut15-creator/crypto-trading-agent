@@ -771,29 +771,23 @@
 
   // ─── Trades table ────────────────────────────────────────────────────────────
 
-  function updateTradesTable(rows, trades) {
+  function parsePnlFromAction(actionStr) {
+    // Matches "P&L trade: +3.75 USDT" or "P&L trade: -0.50 USDT / +1.1%"
+    const m = actionStr.match(/P&L trade:\s*([+\-]?\d+\.?\d*)\s*USDT/);
+    return m ? parseFloat(m[1]) : null;
+  }
+
+  function updateTradesTable(rows) {
     const tbody = document.getElementById('trades-tbody');
 
-    // Filter trade events from xlsx (ACHETER / VENDRE only), newest first
+    // Keep only rows where an actual trade was executed, newest first
     const events = rows
       .filter(r => {
-        const rec = (r['Recommandation'] || '').trim().toUpperCase();
-        return rec === 'ACHETER' || rec === 'VENDRE';
+        const action = r['Action simulée'] || '';
+        return action.includes('ACHAT FICTIF') || action.includes('VENTE FICTIVE');
       })
       .slice()
       .reverse();
-
-    // Index closed trades from trades_history by closing date for P&L lookup
-    const closedByDate = {};
-    if (trades) {
-      trades
-        .filter(t => t.status === 'closed' && t.timestamp_fermeture)
-        .forEach(t => {
-          const k = t.timestamp_fermeture.substring(0, 10);
-          if (!closedByDate[k]) closedByDate[k] = [];
-          closedByDate[k].push(t);
-        });
-    }
 
     if (events.length === 0) {
       tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Aucun trade enregistré</td></tr>';
@@ -801,28 +795,23 @@
     }
 
     tbody.innerHTML = events.map(r => {
-      const rec   = (r['Recommandation'] || '').trim().toUpperCase();
-      const isBuy = rec === 'ACHETER';
-      const date  = rowDate(r) + ' ' + rowTime(r);
-      const prix  = parseFloat(r['Prix BTC (USDT)']);
-      const score = parseInt(r['Score sentiment']);
-      const model = (r['Modèle Claude utilisé'] || '')
+      const action = r['Action simulée'] || '';
+      const isBuy  = action.includes('ACHAT FICTIF');
+      const date   = rowDate(r) + ' ' + rowTime(r);
+      const prix   = parseFloat(r['Prix BTC (USDT)']);
+      const score  = parseInt(r['Score sentiment']);
+      const model  = (r['Modèle Claude utilisé'] || '')
         .replace('claude-', '')
-        .replace(/-\d{8,}$/, '');  // strip date suffix like -20251001
+        .replace(/-\d{8,}$/, '');
 
-      // P&L lookup for VENDRE rows
+      // P&L parsed directly from "Action simulée" text (only present on VENTE rows)
       let pnlHtml = '<span style="color:var(--muted)">—</span>';
       if (!isBuy) {
-        const key    = rowDate(r);
-        const bucket = closedByDate[key] || [];
-        // Find trade whose exit price is close to this row's price
-        const match  = bucket.find(t => Math.abs(parseFloat(t.prix_sortie) - prix) < 500) || bucket[0];
-        if (match && match.pnl_usdt != null) {
-          const pnl    = match.pnl_usdt;
-          const pnlPct = match.pnl_pct;
-          const sign   = pnl >= 0 ? '+' : '';
-          const cls    = pnl >= 0 ? 'c-gain' : 'c-loss';
-          pnlHtml = `<span class="${cls}">${sign}${fmt(pnl)} USDT (${fmtPct(pnlPct)})</span>`;
+        const pnl = parsePnlFromAction(action);
+        if (pnl != null) {
+          const cls  = pnl >= 0 ? 'c-gain' : 'c-loss';
+          const sign = pnl >= 0 ? '+' : '';
+          pnlHtml = `<span class="${cls}">${sign}${fmt(pnl)} USDT</span>`;
         }
       }
 
@@ -859,10 +848,9 @@
     errBanner.style.display = 'none';
 
     try {
-      const [portfolio, xlsxRows, trades] = await Promise.all([
+      const [portfolio, xlsxRows] = await Promise.all([
         fetchJSON('portfolio_state.json'),
-        fetchXLSX('trading_journal.xlsx'),
-        fetchJSON('trades_history.json').catch(() => null)
+        fetchXLSX('trading_journal.xlsx')
       ]);
 
       // Keep only rows with a valid capital value
@@ -877,7 +865,7 @@
       updateKPIs(portfolio, validRows);
       updateChart(validRows);
       updatePositionEncart(portfolio, validRows);
-      updateTradesTable(validRows, trades);
+      updateTradesTable(validRows);
 
       document.getElementById('loader').classList.add('hidden');
     } catch (err) {

@@ -73,6 +73,7 @@ SEUIL_NEWS_PERTINENTES = 2
 FRAIS_TRADING         = 0.001
 STOP_LOSS_PCT         = 0.07   # protection absolue crash brutal (-7% depuis l'achat)
 TRAILING_STOP_PCT     = 0.025  # recul maximal depuis le prix max atteint (-2.5%)
+TAKE_PROFIT_PCT       = 0.025  # gain minimum pour déclencher le take-profit (+2.5%)
 MIN_PNL_PCT           = 0.005  # P&L net minimum = 0.5% du capital engagé
 
 LIMITE_COUT_QUOTIDIEN_USD = 1.00
@@ -833,16 +834,55 @@ def analyser_avec_claude(prix_btc: float, news: list, portefeuille: dict = None,
 
 
 # ─────────────────────────────────────────────────────────────
+#  FILTRE DE DÉCISION SYMÉTRIQUE
+# ─────────────────────────────────────────────────────────────
+
+def decision_finale(reco: str, score: int, modele: str, confiance) -> str:
+    """Applique un filtre symétrique et cohérent sur la recommandation brute de Claude.
+
+    Seuils : Sonnet → 5, Haiku → 6 (plus exigeant, car pas de champ confiance).
+    Sonnet : confiance >= 3 requise pour valider ACHETER ou VENDRE.
+    Modèle inconnu : traité comme Haiku (conservateur).
+    """
+    if modele == MODELE_SONNET:
+        seuil = 5
+    else:
+        seuil = 6  # MODELE_HAIKU ou inconnu
+
+    if reco == "ACHETER":
+        if score >= seuil:
+            if modele == MODELE_SONNET and (confiance is None or confiance < 3):
+                log(f"⛔ Achat downgrade : confiance {confiance}/5 < 3 → ATTENDRE")
+                return "ATTENDRE"
+            return "ACHETER"
+        log(f"⛔ Achat bloqué : score {score:+d} < seuil +{seuil} → ATTENDRE")
+        return "ATTENDRE"
+
+    if reco == "VENDRE":
+        if score <= -seuil:
+            if modele == MODELE_SONNET and (confiance is None or confiance < 3):
+                log(f"⛔ Vente downgrade : confiance {confiance}/5 < 3 → ATTENDRE")
+                return "ATTENDRE"
+            return "VENDRE"
+        log(f"⛔ Vente bloquée : score {score:+d} > seuil -{seuil} → ATTENDRE")
+        return "ATTENDRE"
+
+    return "ATTENDRE"
+
+
+# ─────────────────────────────────────────────────────────────
 #  ÉTAPE 6 : SIMULATION DE TRADING (paper trading — argent fictif)
 # ─────────────────────────────────────────────────────────────
 
 def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float,
-                        score_sentiment: int = 0, rsi: float = None) -> tuple:
+                        score_sentiment: int = 0, rsi: float = None,
+                        fg_valeur=None) -> tuple:
     """
     Simule un achat ou une vente de BTC selon la recommandation de Claude.
-    Applique : frais 0.1%, stop-loss -7% (absolu), trailing stop -4% depuis le max,
-               cooldown 4h post-trade, limite 4 trades/jour,
-               P&L attendu minimum 1,50 USDT.
+    Applique : frais 0.1%, stop-loss -7% (absolu), trailing stop -2.5% depuis le max,
+               take-profit +2.5% (si RSI >= 65), cooldown 4h post-trade,
+               limite 4 trades/jour, P&L attendu minimum 0.5%.
+    Fear & Greed contrarian : annule les signaux simples en extrêmes (≤20 / ≥80).
     ⚠️  AUCUN ordre réel n'est envoyé à Binance — 100% fictif.
     """
     action       = "AUCUNE ACTION"
@@ -879,14 +919,14 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
                 log(f"📊 Trailing stop actif : seuil {seuil_trailing:,.0f} USDT "
                     f"(max: {prix_max:,.0f} USDT | actuel: {prix_btc:,.0f} USDT)")
 
-    # ── Garde-fous RSI (signal uniquement — stop-loss/trailing non bloqués) ──
-    if recommandation == "ACHETER" and rsi is not None and rsi > 70:
-        log(f"⛔ ACHETER bloqué : RSI {rsi:.1f} > 70 (surachat) → ATTENDRE")
-        recommandation = "ATTENDRE"
-
-    if recommandation == "VENDRE" and not raison_vente and rsi is not None and rsi < 30:
-        log(f"⛔ VENDRE (signal) bloqué : RSI {rsi:.1f} < 30 (survente) → ATTENDRE")
-        recommandation = "ATTENDRE"
+    # ── Take-profit (avant filtre P&L — priorité sur MIN_PNL_PCT) ──
+    if (portefeuille["en_position"] and portefeuille["prix_achat_btc"] > 0
+            and not raison_vente and rsi is not None and rsi >= 65):
+        variation_tp = prix_btc / portefeuille["prix_achat_btc"] - 1
+        if variation_tp >= TAKE_PROFIT_PCT:
+            log(f"💰 TAKE PROFIT déclenché (+{variation_tp*100:.1f}% + RSI {rsi:.1f}) → vente forcée")
+            recommandation = "VENDRE"
+            raison_vente   = "take-profit"
 
     # ── Vérification cooldown post-trade (4h entre trades opposés) ──
     if recommandation in ("ACHETER", "VENDRE"):
@@ -898,17 +938,31 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
                 and temps_ecoule < COOLDOWN_POST_TRADE_S
                 and not raison_vente):  # SL/TP ignorent le cooldown
             restant = int((COOLDOWN_POST_TRADE_S - temps_ecoule) / 60)
-            log(f"⏳ COOLDOWN actif ({dernier_type} → {recommandation}) "
-                f"— encore ~{restant} min à attendre")
+            log(f"⏳ [FILTRE COOLDOWN] {dernier_type} → {recommandation} bloqué "
+                f"— encore ~{restant} min à attendre (cooldown {COOLDOWN_POST_TRADE_S//3600}h)")
             recommandation = "ATTENDRE"
 
     # ── Vérification limite quotidienne de trades ──
     if recommandation in ("ACHETER", "VENDRE") and not raison_vente:
         nb_trades = portefeuille.get("trades_aujourd_hui", 0)
         if nb_trades >= MAX_TRADES_PAR_JOUR:
-            log(f"🚫 Limite de {MAX_TRADES_PAR_JOUR} trades/jour atteinte "
-                f"({nb_trades} trades) → ATTENDRE")
+            log(f"🚫 [FILTRE LIMITE JOUR] {recommandation} bloqué : "
+                f"{nb_trades}/{MAX_TRADES_PAR_JOUR} trades atteints aujourd'hui → ATTENDRE")
             recommandation = "ATTENDRE"
+
+    # ── Fear & Greed contrarian (signaux simples uniquement — stops jamais annulés) ──
+    _stops = ("stop-loss", "trailing-stop", "take-profit")
+    if fg_valeur is not None:
+        if recommandation == "VENDRE" and raison_vente not in _stops:
+            if fg_valeur <= 20:
+                log(f"🧘 [FILTRE F&G] VENDRE signal annulé : F&G {fg_valeur}/100 ≤ 20 "
+                    f"(Extreme Fear — vente en survente extrême évitée) → ATTENDRE")
+                recommandation = "ATTENDRE"
+        if recommandation == "ACHETER":
+            if fg_valeur >= 80:
+                log(f"🧘 [FILTRE F&G] ACHETER annulé : F&G {fg_valeur}/100 ≥ 80 "
+                    f"(Extreme Greed — achat en surachat extrême évité) → ATTENDRE")
+                recommandation = "ATTENDRE"
 
     # ── Vérification P&L attendu minimum (0.5% du capital engagé) ──
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
@@ -916,7 +970,8 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
         seuil_achat       = capital_dispo * MIN_PNL_PCT
         pnl_attendu_achat = capital_dispo * TRAILING_STOP_PCT - 2 * capital_dispo * FRAIS_TRADING
         if pnl_attendu_achat < seuil_achat:
-            log(f"💡 P&L attendu (ref. trailing stop: {pnl_attendu_achat:.2f} USDT) < {seuil_achat:.2f} USDT (0.5% de {capital_dispo:.0f}) → ATTENDRE")
+            log(f"💡 [FILTRE PNL MIN] ACHETER bloqué : P&L attendu {pnl_attendu_achat:.2f} USDT "
+                f"< seuil {seuil_achat:.2f} USDT (0.5% de {capital_dispo:.0f}) → ATTENDRE")
             recommandation = "ATTENDRE"
 
     if recommandation == "VENDRE" and portefeuille["en_position"] and not raison_vente:
@@ -926,7 +981,9 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
         pnl_si_vente    = val_brute_check - frais_v_check - btc_held * portefeuille["prix_achat_btc"]
         seuil_vente     = val_brute_check * MIN_PNL_PCT
         if pnl_si_vente < seuil_vente:
-            log(f"💡 P&L si vente maintenant ({pnl_si_vente:.2f} USDT) < {seuil_vente:.2f} USDT (0.5% de {val_brute_check:.0f}) → ATTENDRE")
+            log(f"💡 [FILTRE PNL MIN] VENDRE signal bloqué : P&L={pnl_si_vente:.2f} USDT "
+                f"< seuil {seuil_vente:.2f} USDT (0.5% de {val_brute_check:.0f}) "
+                f"— achat à {portefeuille['prix_achat_btc']:,.0f}$, prix actuel {prix_btc:,.0f}$ → ATTENDRE")
             recommandation = "ATTENDRE"
 
     if recommandation == "ACHETER" and not portefeuille["en_position"]:
@@ -1011,6 +1068,14 @@ def simuler_transaction(portefeuille: dict, recommandation: str, prix_btc: float
         log(action)
 
     else:
+        # Cas ignorés silencieux — on les explicite pour audit
+        if recommandation == "ACHETER" and portefeuille["en_position"]:
+            log(f"⏭️  [IGNORÉ] ACHETER reçu mais déjà en position "
+                f"({portefeuille['btc_en_stock']:.6f} BTC à {portefeuille['prix_achat_btc']:,.0f}$) → aucune action")
+        elif recommandation == "VENDRE" and not portefeuille["en_position"]:
+            log(f"⏭️  [IGNORÉ] VENDRE reçu mais pas de position BTC ouverte "
+                f"(capital disponible : {portefeuille['usdt_disponible']:.2f} USDT) → aucune action")
+
         valeur_actuelle = calculer_valeur_portfolio(portefeuille, prix_btc)
         if portefeuille["en_position"]:
             variation  = (prix_btc / portefeuille["prix_achat_btc"] - 1) * 100
@@ -1241,22 +1306,39 @@ def executer_un_cycle(portefeuille: dict) -> dict:
     # ── Étapes 3 & 4 : Analyser avec Claude (données marché passées, 0 appel CoinGecko supplémentaire) ──
     analyse = analyser_avec_claude(prix_btc, nouvelles_news, portefeuille=portefeuille, marche=donnees_btc, rsi=rsi)
 
-    # ── Étape 6 : Simuler une transaction ──
-    recommandation = analyse.get("recommandation", "ATTENDRE")
+    # ── Garde-fous RSI appliqués AVANT decision_finale (signaux Claude uniquement) ──
+    # Les stop-loss/trailing ne passent pas ici — ils sont gérés dans simuler_transaction.
+    reco_claude = analyse.get("recommandation", "ATTENDRE")
+    if rsi is not None and reco_claude != "ATTENDRE":
+        if reco_claude == "ACHETER" and rsi > 70:
+            log(f"⛔ [RSI PRÉ-FILTRE] ACHETER bloqué : RSI {rsi:.1f} > 70 "
+                f"(surachat — achat en zone de retournement évité) → ATTENDRE")
+            reco_claude = "ATTENDRE"
+        elif reco_claude == "ACHETER" and rsi < 30:
+            log(f"⛔ [RSI PRÉ-FILTRE] ACHETER bloqué : RSI {rsi:.1f} < 30 "
+                f"(tendance baissière forte — couteau qui tombe) → ATTENDRE")
+            reco_claude = "ATTENDRE"
+        elif reco_claude == "VENDRE" and rsi < 30:
+            log(f"⛔ [RSI PRÉ-FILTRE] VENDRE (signal) bloqué : RSI {rsi:.1f} < 30 "
+                f"(survente — vendre en bas de canal évité) → ATTENDRE")
+            reco_claude = "ATTENDRE"
+    elif rsi is None and reco_claude != "ATTENDRE":
+        log(f"⚠️  [RSI PRÉ-FILTRE] RSI indisponible — garde-fou RSI désactivé ce cycle "
+            f"(signal Claude {reco_claude} transmis tel quel à decision_finale)")
 
-    # Hausser le seuil de vente : score ≤ -5 ET Sonnet requis (pas Haiku seul)
-    if recommandation == "VENDRE":
-        score_analyse  = analyse.get("score", 0)
-        modele_analyse = analyse.get("modele_utilise", "")
-        if score_analyse > -5 or modele_analyse != MODELE_SONNET:
-            log(f"⛔ Vente bloquée : score {score_analyse:+d} (requis ≤ -5) "
-                f"ou modèle non Sonnet ({modele_analyse}) → ATTENDRE")
-            recommandation = "ATTENDRE"
+    # ── Étape 6 : Simuler une transaction ──
+    recommandation = decision_finale(
+        reco=reco_claude,
+        score=analyse.get("score", 0),
+        modele=analyse.get("modele_utilise", ""),
+        confiance=analyse.get("confiance"),
+    )
 
     action, portefeuille = simuler_transaction(
         portefeuille, recommandation, prix_btc,
         score_sentiment=analyse.get("score", 0),
-        rsi=rsi
+        rsi=rsi,
+        fg_valeur=analyse.get("fear_greed_valeur"),
     )
 
     # ── Sauvegarder le portefeuille ──
@@ -1314,6 +1396,7 @@ def main():
     log(f"   Frais trading            : {FRAIS_TRADING*100:.1f}% par trade")
     log(f"   Stop-loss (absolu)       : -{STOP_LOSS_PCT*100:.0f}%")
     log(f"   Trailing stop            : -{TRAILING_STOP_PCT*100:.0f}% depuis le prix max")
+    log(f"   Take-profit              : +{TAKE_PROFIT_PCT*100:.0f}% (si RSI ≥ 65)")
     log(f"   Cooldown post-trade      : {COOLDOWN_POST_TRADE_S // 3600}h")
     log(f"   Max trades/jour          : {MAX_TRADES_PAR_JOUR}")
     log(f"   Filtre âge news          : {FILTRE_AGE_MAX_SECONDES // 3600}h max")
