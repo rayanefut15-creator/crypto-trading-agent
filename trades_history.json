@@ -37,14 +37,14 @@
   },
   {
     "timestamp_ouverture": "2026-05-28T18:32:49.864170+00:00",
-    "timestamp_fermeture": null,
+    "timestamp_fermeture": "2026-06-01T16:29:38.384599+00:00",
     "prix_entree": 100000.0,
-    "prix_sortie": null,
-    "pnl_usdt": null,
-    "pnl_pct": null,
-    "duree_minutes": null,
+    "prix_sortie": 70897.0,
+    "pnl_usdt": -10.8262,
+    "pnl_pct": -3.49,
+    "duree_minutes": 5636.8,
     "score_sentiment": 0,
-    "raison_sortie": null,
-    "status": "open"
+    "raison_sortie": "trailing-stop",
+    "status": "closed"
   }
 ]
