@@ -70,5 +70,17 @@
     "score_sentiment": 6,
     "raison_sortie": "take-profit",
     "status": "closed"
+  },
+  {
+    "timestamp_ouverture": "2026-06-22T22:22:30.935388+00:00",
+    "timestamp_fermeture": null,
+    "prix_entree": 64194.0,
+    "prix_sortie": null,
+    "pnl_usdt": null,
+    "pnl_pct": null,
+    "duree_minutes": null,
+    "score_sentiment": 5,
+    "raison_sortie": null,
+    "status": "open"
   }
 ]
