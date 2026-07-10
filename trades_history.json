@@ -130,5 +130,17 @@
     "score_sentiment": 6,
     "raison_sortie": "trailing-stop",
     "status": "closed"
+  },
+  {
+    "timestamp_ouverture": "2026-07-10T08:52:41.597057+00:00",
+    "timestamp_fermeture": null,
+    "prix_entree": 64169.0,
+    "prix_sortie": null,
+    "pnl_usdt": null,
+    "pnl_pct": null,
+    "duree_minutes": null,
+    "score_sentiment": 5,
+    "raison_sortie": null,
+    "status": "open"
   }
 ]
