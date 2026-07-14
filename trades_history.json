@@ -142,5 +142,17 @@
     "score_sentiment": 5,
     "raison_sortie": "stop-loss",
     "status": "closed"
+  },
+  {
+    "timestamp_ouverture": "2026-07-14T17:22:21.922040+00:00",
+    "timestamp_fermeture": null,
+    "prix_entree": 64406.0,
+    "prix_sortie": null,
+    "pnl_usdt": null,
+    "pnl_pct": null,
+    "duree_minutes": null,
+    "score_sentiment": 5,
+    "raison_sortie": null,
+    "status": "open"
   }
 ]
