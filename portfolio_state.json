@@ -1,12 +1,12 @@
 {
-  "usdt_disponible": 0.0,
-  "btc_en_stock": 0.004391336669590605,
-  "en_position": true,
-  "prix_achat_btc": 64053.0,
+  "usdt_disponible": 290.2621907434624,
+  "btc_en_stock": 0.0,
+  "en_position": false,
+  "prix_achat_btc": 0.0,
   "prix_initial_bh": 76974.0,
-  "dernier_trade_timestamp": 1784387791.321476,
-  "dernier_trade_type": "ACHETER",
-  "trades_aujourd_hui": 0,
+  "dernier_trade_timestamp": 1784625450.2960856,
+  "dernier_trade_type": "VENDRE",
+  "trades_aujourd_hui": 1,
   "date_trades": "2026-07-21",
-  "prix_max_depuis_achat": 65863.0
+  "prix_max_depuis_achat": 0.0
 }
