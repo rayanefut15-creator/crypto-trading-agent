@@ -193,14 +193,14 @@
   },
   {
     "timestamp_ouverture": "2026-08-15T15:58:24.594264+00:00",
-    "timestamp_fermeture": null,
+    "timestamp_fermeture": "2026-08-18T14:44:07.366392+00:00",
     "prix_entree": 63040.0,
-    "prix_sortie": null,
-    "pnl_usdt": null,
-    "pnl_pct": null,
-    "duree_minutes": null,
+    "prix_sortie": 64754.0,
+    "pnl_usdt": 7.244,
+    "pnl_pct": 2.62,
+    "duree_minutes": 4245.7,
     "score_sentiment": 6,
-    "raison_sortie": null,
-    "status": "open"
+    "raison_sortie": "take-profit",
+    "status": "closed"
   }
 ]
